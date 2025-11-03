@@ -14,6 +14,9 @@ type ChatMessage = {
 // The Cloudflare tunnel proxies both frontend and backend on the same domain
 const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') || ''
 
+// Feature flags
+const ENABLE_TTS_STREAM = import.meta.env.VITE_ENABLE_TTS_STREAM === 'true' || false
+
 const MEDIA_MIME_TYPES = [
   'audio/webm;codecs=opus',
   'audio/ogg;codecs=opus',
@@ -27,6 +30,99 @@ const createId = () =>
   (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2, 11))
+
+// Helper function to decode base64 to Float32Array
+function base64ToFloat32Array(base64: string): Float32Array {
+  const binaryString = atob(base64)
+  const bytes = new Uint8Array(binaryString.length)
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i)
+  }
+  return new Float32Array(bytes.buffer)
+}
+
+// PCM Stream Player class for streaming audio playback
+class PCMStreamPlayer {
+  private audioContext: AudioContext
+  private gainNode: GainNode
+  private bufferQueue: Float32Array[] = []
+  private isPlaying = false
+  private currentSource: AudioBufferSourceNode | null = null
+  private onEndedCallback: (() => void) | null = null
+
+  constructor(sampleRate = 44100) {
+    this.audioContext = new AudioContext({ sampleRate })
+    this.gainNode = this.audioContext.createGain()
+    this.gainNode.connect(this.audioContext.destination)
+  }
+
+  addChunk(pcmData: Float32Array) {
+    this.bufferQueue.push(pcmData)
+    if (!this.isPlaying) {
+      this.playNext()
+    }
+  }
+
+  private playNext() {
+    if (this.bufferQueue.length === 0) {
+      this.isPlaying = false
+      if (this.onEndedCallback) {
+        this.onEndedCallback()
+      }
+      return
+    }
+
+    this.isPlaying = true
+    const chunk = this.bufferQueue.shift()!
+    const audioBuffer = this.audioContext.createBuffer(
+      1, // mono
+      chunk.length,
+      this.audioContext.sampleRate
+    )
+
+    // Get the channel data and copy manually to avoid TypeScript issues
+    const channelData = audioBuffer.getChannelData(0)
+    for (let i = 0; i < chunk.length; i++) {
+      channelData[i] = chunk[i]
+    }
+
+    const source = this.audioContext.createBufferSource()
+    source.buffer = audioBuffer
+    source.connect(this.gainNode)
+    source.onended = () => this.playNext()
+    this.currentSource = source
+    source.start()
+  }
+
+  stop() {
+    if (this.currentSource) {
+      try {
+        this.currentSource.stop()
+      } catch (e) {
+        // Ignore if already stopped
+      }
+      this.currentSource = null
+    }
+    this.bufferQueue = []
+    this.isPlaying = false
+  }
+
+  onEnded(callback: () => void) {
+    this.onEndedCallback = callback
+  }
+
+  setVolume(volume: number) {
+    this.gainNode.gain.value = Math.max(0, Math.min(1, volume))
+  }
+
+  getVolume(): number {
+    return this.gainNode.gain.value
+  }
+
+  getAudioContext() {
+    return this.audioContext
+  }
+}
 
 const App = () => {
   // Log API configuration on mount
@@ -44,6 +140,7 @@ const App = () => {
   const [isPlaying, setIsPlaying] = useState(false) // Track if AI is speaking
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null) // Track which message is playing
   const [audioLevels, setAudioLevels] = useState<number[]>([0, 0, 0, 0, 0]) // Audio equalizer bars
+  const [autoplayBlockedMessageId, setAutoplayBlockedMessageId] = useState<string | null>(null) // Track message that needs manual play
 
   const messagesRef = useRef<ChatMessage[]>([])
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null)
@@ -64,7 +161,9 @@ const App = () => {
   const pcmChunksRef = useRef<Float32Array[]>([])
   const sampleRateRef = useRef<number>(44100)
   const processorRef = useRef<ScriptProcessorNode | null>(null)
-  const animationFrameRef = useRef<number | null>(null)
+  const chatAbortControllerRef = useRef<AbortController | null>(null)
+  const ttsAbortControllerRef = useRef<AbortController | null>(null)
+  const isProcessingRef = useRef<boolean>(false) // Ref to avoid dependency issues
 
   function mergeFloat32(chunks: Float32Array[]) {
     const total = chunks.reduce((sum, c) => sum + c.length, 0)
@@ -164,6 +263,9 @@ const App = () => {
     voiceMsRef.current = 0
     silenceMsRef.current = 0
     segmentChunksRef.current = []
+    // Clear VAD buffers to ensure fresh segments
+    headerChunkRef.current = null
+    pcmChunksRef.current = []
   }, [])
 
   useEffect(() => {
@@ -195,21 +297,29 @@ const App = () => {
     const audio = new Audio(latestSpokenMessage.audioUrl)
     currentAudioRef.current = audio
 
-    // Pause recording while AI is speaking to prevent feedback
+    // Reset volume to full before starting new playback
+    // (in case previous playback ended while ducked)
+    audio.volume = 1.0
+
+    // Only pause recording if full duplex is disabled
+    const enableFullDuplex = import.meta.env.VITE_ENABLE_FULL_DUPLEX === 'true'
     const wasRecording = isRecording
-    if (wasRecording) {
+    console.log('[TTS Non-Stream] Full duplex enabled:', enableFullDuplex, 'Was recording:', wasRecording)
+    if (wasRecording && !enableFullDuplex) {
+      console.log('[TTS Non-Stream] Stopping recorder (full duplex disabled)')
       resetRecorder()
     }
 
     setIsPlaying(true)
     setPlayingMessageId(latestSpokenMessage.id)
+    setAutoplayBlockedMessageId(null) // Clear any previous autoplay block
 
     audio.onended = () => {
       setIsPlaying(false)
       setPlayingMessageId(null)
       currentAudioRef.current = null
-      // Resume recording after AI finishes speaking
-      if (wasRecording) {
+      // Resume recording after AI finishes speaking (only if full duplex is disabled)
+      if (wasRecording && !enableFullDuplex) {
         setTimeout(async () => {
           // Get fresh microphone access
           try {
@@ -250,12 +360,13 @@ const App = () => {
       .play()
       .catch((err) => {
         console.error('Autoplay failed', err)
-        setError((prev) => prev ?? 'Autoplay was blocked. Press play to listen.')
+        setError((prev) => prev ?? 'Autoplay was blocked. Click the play button to listen.')
         setIsPlaying(false)
         setPlayingMessageId(null)
+        setAutoplayBlockedMessageId(latestSpokenMessage.id)
         currentAudioRef.current = null
-        // Resume recording even if playback failed
-        if (wasRecording) {
+        // Resume recording even if playback failed (only if full duplex is disabled)
+        if (wasRecording && !enableFullDuplex) {
           setTimeout(async () => {
             try {
               const constraints: MediaStreamConstraints = selectedMicId
@@ -301,6 +412,35 @@ const App = () => {
     }
   }, [resetRecorder])
 
+  // Manual play handler for autoplay-blocked messages
+  const handleManualPlay = useCallback((messageId: string) => {
+    const message = messages.find(m => m.id === messageId)
+    if (!message?.audioUrl) return
+
+    const audio = new Audio(message.audioUrl)
+    currentAudioRef.current = audio
+    audio.volume = 1.0
+
+    setIsPlaying(true)
+    setPlayingMessageId(messageId)
+    setAutoplayBlockedMessageId(null)
+    setError(null)
+
+    audio.onended = () => {
+      setIsPlaying(false)
+      setPlayingMessageId(null)
+      currentAudioRef.current = null
+    }
+
+    audio.play().catch((err) => {
+      console.error('Manual play failed', err)
+      setError('Failed to play audio')
+      setIsPlaying(false)
+      setPlayingMessageId(null)
+      currentAudioRef.current = null
+    })
+  }, [messages])
+
   // When we finish processing, auto-handle any pending recorded segment
   useEffect(() => {
     if (!isProcessing && pendingSegmentRef.current) {
@@ -341,10 +481,15 @@ const App = () => {
     const url = `${API_BASE}/api/chat`
     console.log('[API] Requesting chat completion:', url)
 
+    // Create abort controller for this request
+    const controller = new AbortController()
+    chatAbortControllerRef.current = controller
+
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: payload }),
+      signal: controller.signal,
     })
 
     console.log('[API] Chat response status:', response.status)
@@ -377,14 +522,118 @@ const App = () => {
     return content.trim()
   }, [])
 
+  const requestChatCompletionStream = useCallback(
+    async (history: ChatMessage[], onToken: (token: string) => void) => {
+      const payload = history.map((entry) => ({
+        role: entry.role,
+        content: entry.text,
+      }))
+
+      const url = `${API_BASE}/api/chat/stream`
+      console.log('[API] Requesting streaming chat completion:', url)
+
+      // Create abort controller for this request
+      const controller = new AbortController()
+      chatAbortControllerRef.current = controller
+
+      // Add timeout for the entire stream (30 seconds)
+      const timeoutId = setTimeout(() => {
+        console.warn('[Chat Stream] Timeout after 30s, aborting')
+        controller.abort()
+      }, 30000)
+
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: payload }),
+          signal: controller.signal,
+        })
+
+        console.log('[API] Chat stream response status:', response.status)
+
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}))
+          console.error('[API] Chat stream error:', body)
+          throw new Error(body?.error || 'Streaming chat completion failed')
+        }
+
+        if (!response.body) {
+          throw new Error('No response body for streaming chat')
+        }
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let fullContent = ''
+        let buffer = '' // Persistent buffer for chunk-safe parsing
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) {
+              console.log('[Chat Stream] Stream done, exiting read loop')
+              break
+            }
+
+            buffer += decoder.decode(value, { stream: true })
+
+            // Parse SSE events (format: "data: <json>\n\n")
+            let idx
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+              const frame = buffer.slice(0, idx)
+              buffer = buffer.slice(idx + 2)
+
+              const match = frame.match(/^data:\s*(.*)$/m)
+              if (match && match[1]) {
+                const data = match[1].trim()
+                if (data === '[DONE]') {
+                  console.log('[Chat Stream] Received [DONE] marker')
+                  continue
+                }
+
+                try {
+                  const parsed = JSON.parse(data)
+                  const delta = parsed.choices?.[0]?.delta?.content
+                  if (delta) {
+                    fullContent += delta
+                    onToken(delta)
+                  }
+                } catch (e) {
+                  console.error('[Chat Stream] Failed to parse JSON:', e)
+                }
+              }
+            }
+          }
+        } finally {
+          console.log('[Chat Stream] Releasing reader lock, fullContent length:', fullContent.length)
+          reader.releaseLock()
+        }
+
+        if (!fullContent.trim()) {
+          throw new Error('Assistant response was empty')
+        }
+
+        return fullContent.trim()
+      } finally {
+        clearTimeout(timeoutId)
+      }
+    },
+    []
+  )
+
   const synthesizeSpeech = useCallback(async (text: string) => {
     const url = `${API_BASE}/api/tts`
     console.log('[API] Requesting TTS:', url)
+
+    // Create abort controller for this request
+    const controller = new AbortController()
+    ttsAbortControllerRef.current = controller
 
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
+      signal: controller.signal,
     })
 
     console.log('[API] TTS response status:', response.status)
@@ -402,6 +651,96 @@ const App = () => {
     }
 
     return body.audio as string
+  }, [])
+
+  // PCM Stream Player for streaming TTS
+  const pcmStreamPlayerRef = useRef<PCMStreamPlayer | null>(null)
+
+  const synthesizeSpeechStream = useCallback(async (
+    text: string,
+    onChunk: (pcmData: Float32Array) => void,
+    signal?: AbortSignal
+  ) => {
+    const url = `${API_BASE}/api/tts/stream`
+    console.log('[API] Requesting streaming TTS:', url, 'text length:', text.length)
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+      signal,
+    })
+
+    console.log('[API] Streaming TTS response status:', response.status)
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      console.error('[API] Streaming TTS error:', body)
+      throw new Error(body?.error || 'Streaming TTS failed')
+    }
+
+    if (!response.body) {
+      throw new Error('No stream body in response')
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    let chunkCount = 0
+    try {
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) {
+          console.log('[TTS Stream] Stream done, received', chunkCount, 'chunks')
+          break
+        }
+
+        buffer += decoder.decode(value, { stream: true })
+
+        // Parse SSE events (format: "data: {\"type\":\"chunk\",\"data\":\"<base64>\"}\n\n")
+        let idx
+        while ((idx = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+
+          const match = frame.match(/^data:\s*(.*)$/m)
+          if (match && match[1]) {
+            try {
+              const jsonData = match[1].trim()
+              if (!jsonData) continue
+
+              // Parse JSON response from Cartesia
+              const chunk = JSON.parse(jsonData)
+
+              if (chunk.type === 'chunk' && chunk.data) {
+                // chunk.data contains base64-encoded PCM data
+                const pcmData = base64ToFloat32Array(chunk.data)
+                chunkCount++
+                if (chunkCount === 1) {
+                  console.log('[TTS Stream] First chunk received, base64 length:', chunk.data.length)
+                }
+                onChunk(pcmData)
+              } else if (chunk.type === 'done') {
+                console.log('[TTS Stream] Stream completed, total chunks:', chunkCount)
+                break
+              } else if (chunk.type === 'error') {
+                console.error('[TTS Stream] Server error:', chunk.message)
+                throw new Error(chunk.message || 'TTS stream error')
+              } else {
+                console.warn('[TTS Stream] Unknown chunk type:', chunk.type, chunk)
+              }
+            } catch (err) {
+              console.error('[TTS Stream] Failed to parse chunk:', err)
+              console.error('[TTS Stream] Raw data (first 200 chars):', match[1].substring(0, 200))
+            }
+          }
+        }
+      }
+    } finally {
+      console.log('[TTS Stream] Releasing reader, total chunks received:', chunkCount)
+      reader.releaseLock()
+    }
   }, [])
 
   const transcribeAudio = useCallback(async (blob: Blob, encoding: string) => {
@@ -465,49 +804,175 @@ const App = () => {
       setStatus('Thinking...')
 
       try {
-        const assistantText = await requestChatCompletion(conversationWithUser)
+        const enableChatStream = import.meta.env.VITE_ENABLE_CHAT_STREAM === 'true' || false
+        let assistantText = ''
         const assistantId = createId()
-        const assistantMessage: ChatMessage = {
-          id: assistantId,
-          role: 'assistant',
-          text: assistantText,
-          status: 'pending' as const,
+
+        if (enableChatStream) {
+          // Use streaming chat - show tokens as they arrive
+          console.log('[Chat] Using streaming mode')
+          const chatStartTime = performance.now()
+
+          const assistantMessage: ChatMessage = {
+            id: assistantId,
+            role: 'assistant',
+            text: '',
+            status: 'pending' as const,
+          }
+
+          const conversationWithAssistant: ChatMessage[] = [
+            ...conversationWithUser,
+            assistantMessage,
+          ]
+          messagesRef.current = conversationWithAssistant
+          setMessages(conversationWithAssistant)
+
+          let firstTokenTime: number | null = null
+          // Stream tokens and update message in real-time
+          assistantText = await requestChatCompletionStream(conversationWithUser, (token) => {
+            if (firstTokenTime === null) {
+              firstTokenTime = performance.now()
+              console.log(`⏱️ [TIMING] Chat first token took ${(firstTokenTime - chatStartTime).toFixed(0)}ms`)
+            }
+            assistantMessage.text += token
+            messagesRef.current = [...conversationWithUser, assistantMessage]
+            setMessages([...conversationWithUser, assistantMessage])
+          })
+
+          const chatEndTime = performance.now()
+          console.log(`⏱️ [TIMING] Chat complete took ${(chatEndTime - chatStartTime).toFixed(0)}ms`)
+
+          // Update with final text
+          assistantMessage.text = assistantText
+          messagesRef.current = [...conversationWithUser, assistantMessage]
+          setMessages([...conversationWithUser, assistantMessage])
+        } else {
+          // Use non-streaming chat
+          assistantText = await requestChatCompletion(conversationWithUser)
+          const assistantMessage: ChatMessage = {
+            id: assistantId,
+            role: 'assistant',
+            text: assistantText,
+            status: 'pending' as const,
+          }
+
+          const conversationWithAssistant: ChatMessage[] = [
+            ...conversationWithUser,
+            assistantMessage,
+          ]
+          messagesRef.current = conversationWithAssistant
+          setMessages(conversationWithAssistant)
         }
 
-        const conversationWithAssistant: ChatMessage[] = [
-          ...conversationWithUser,
-          assistantMessage,
-        ]
-        messagesRef.current = conversationWithAssistant
-        setMessages(conversationWithAssistant)
-
         setStatus('Generating voice...')
-        const audioUrl = await synthesizeSpeech(assistantText)
 
-        const finalizedMessages = messagesRef.current.map((entry) =>
-          entry.id === assistantId ? { ...entry, audioUrl, status: 'complete' as const } : entry
-        )
+        if (ENABLE_TTS_STREAM) {
+          // Use streaming TTS
+          console.log('[TTS] Using streaming mode')
+          const ttsStartTime = performance.now()
 
-        messagesRef.current = finalizedMessages
-        setMessages(finalizedMessages)
-        setStatus(null)
+          // Initialize PCM player if not already created
+          if (!pcmStreamPlayerRef.current) {
+            pcmStreamPlayerRef.current = new PCMStreamPlayer(44100)
+          }
+
+          const player = pcmStreamPlayerRef.current
+
+          // Reset volume to full before starting new playback
+          // (in case previous playback ended while ducked)
+          player.setVolume(1.0)
+
+          // Only pause recording if full duplex is disabled
+          const enableFullDuplex = import.meta.env.VITE_ENABLE_FULL_DUPLEX === 'true'
+          const wasRecording = isRecording
+          console.log('[TTS Stream] Full duplex enabled:', enableFullDuplex, 'Was recording:', wasRecording)
+          if (wasRecording && !enableFullDuplex) {
+            console.log('[TTS Stream] Stopping recorder (full duplex disabled)')
+            resetRecorder()
+          }
+
+          // Set up playback state tracking
+          setIsPlaying(true)
+          setPlayingMessageId(assistantId)
+
+          player.onEnded(() => {
+            setIsPlaying(false)
+            setPlayingMessageId(null)
+          })
+
+          // Create abort controller for streaming TTS
+          const ttsController = new AbortController()
+          ttsAbortControllerRef.current = ttsController
+
+          let firstChunkTime: number | null = null
+          // Stream and play audio chunks
+          await synthesizeSpeechStream(
+            assistantText,
+            (pcmData) => {
+              if (firstChunkTime === null) {
+                firstChunkTime = performance.now()
+                console.log(`⏱️ [TIMING] TTS first chunk took ${(firstChunkTime - ttsStartTime).toFixed(0)}ms`)
+              }
+              player.addChunk(pcmData)
+            },
+            ttsController.signal
+          )
+
+          const ttsEndTime = performance.now()
+          console.log(`⏱️ [TIMING] TTS complete took ${(ttsEndTime - ttsStartTime).toFixed(0)}ms`)
+
+          // Mark as complete
+          const finalizedMessages = messagesRef.current.map((entry) =>
+            entry.id === assistantId ? { ...entry, status: 'complete' as const } : entry
+          )
+
+          messagesRef.current = finalizedMessages
+          setMessages(finalizedMessages)
+          setStatus(null)
+        } else {
+          // Use non-streaming TTS (original behavior)
+          const audioUrl = await synthesizeSpeech(assistantText)
+
+          const finalizedMessages = messagesRef.current.map((entry) =>
+            entry.id === assistantId ? { ...entry, audioUrl, status: 'complete' as const } : entry
+          )
+
+          messagesRef.current = finalizedMessages
+          setMessages(finalizedMessages)
+          setStatus(null)
+        }
       } catch (err) {
         console.error(err)
-        const message = err instanceof Error ? err.message : 'Unknown error'
-        setError(message)
-        setStatus(null)
 
-        const recoveredMessages: ChatMessage[] = messagesRef.current.map((entry) =>
-          entry.status === 'pending' ? { ...entry, status: 'error' as const } : entry
-        )
+        // Handle AbortError gracefully (from barge-in)
+        if (err instanceof Error && err.name === 'AbortError') {
+          console.log('[Barge-in] Request aborted by user')
+          setStatus('Interrupted. Listening...')
+          setError(null)
 
-        messagesRef.current = recoveredMessages
-        setMessages(recoveredMessages)
+          // Remove pending messages
+          const recoveredMessages: ChatMessage[] = messagesRef.current.filter((entry) =>
+            entry.status !== 'pending'
+          )
+          messagesRef.current = recoveredMessages
+          setMessages(recoveredMessages)
+        } else {
+          const message = err instanceof Error ? err.message : 'Unknown error'
+          setError(message)
+          setStatus(null)
+
+          const recoveredMessages: ChatMessage[] = messagesRef.current.map((entry) =>
+            entry.status === 'pending' ? { ...entry, status: 'error' as const } : entry
+          )
+
+          messagesRef.current = recoveredMessages
+          setMessages(recoveredMessages)
+        }
       } finally {
         setIsProcessing(false)
       }
     },
-    [requestChatCompletion, synthesizeSpeech]
+    [requestChatCompletion, requestChatCompletionStream, synthesizeSpeech, synthesizeSpeechStream]
   )
 
   const handleFormSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -541,20 +1006,35 @@ const App = () => {
 
   const handleRecordedAudio = useCallback(
     async (blob: Blob, mime: string) => {
-      if (isProcessing) {
+      console.log('[handleRecordedAudio] Called. isProcessing:', isProcessingRef.current, 'isRecording:', isRecording)
+
+      if (isProcessingRef.current) {
         setError('Wait for the current response to finish before recording again.')
         return
       }
 
       const encoding = mime.includes('wav') ? 'wav' : mime.includes('ogg') ? 'ogg' : 'webm'
 
+      isProcessingRef.current = true
       setIsProcessing(true)
       setStatus('Transcribing audio...')
       setError(null)
 
+      console.log('[handleRecordedAudio] Set isProcessing=true, isRecording is still:', isRecording)
+
       try {
+        const t0 = performance.now()
         const transcript = await transcribeAudio(blob, encoding)
+        const t1 = performance.now()
+        console.log(`⏱️ [TIMING] STT took ${(t1 - t0).toFixed(0)}ms`)
+
         await sendMessageFlow(transcript)
+        const t2 = performance.now()
+        console.log(`⏱️ [TIMING] Total flow (STT + Chat + TTS) took ${(t2 - t0).toFixed(0)}ms`)
+
+        // Reset processing flag after successful completion
+        isProcessingRef.current = false
+        setIsProcessing(false)
       } catch (err) {
         console.error(err)
         const message =
@@ -566,17 +1046,17 @@ const App = () => {
           setError(message)
           setStatus(null)
         }
+        isProcessingRef.current = false
         setIsProcessing(false)
       }
     },
-    [isProcessing, sendMessageFlow, transcribeAudio]
+    [sendMessageFlow, transcribeAudio]
+    // Note: isProcessing removed from deps to prevent recorder reset during processing
   )
 
   const startRecording = useCallback(async () => {
-    if (isProcessing) {
-      setError('Please wait for the current response to finish.')
-      return
-    }
+    // Don't check isProcessing here - we want to keep recording even during processing
+    // for full-duplex mode. The VAD will queue segments if needed.
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setError('Microphone access is not supported in this browser.')
@@ -584,9 +1064,25 @@ const App = () => {
     }
 
     try {
+      // Enable echo cancellation, noise suppression, and auto gain control
+      const enableFullDuplex = import.meta.env.VITE_ENABLE_FULL_DUPLEX === 'true' || false
+
       const constraints: MediaStreamConstraints = selectedMicId
-        ? { audio: { deviceId: { exact: selectedMicId } } }
-        : { audio: true }
+        ? {
+            audio: {
+              deviceId: { exact: selectedMicId },
+              echoCancellation: enableFullDuplex,
+              noiseSuppression: enableFullDuplex,
+              autoGainControl: enableFullDuplex
+            }
+          }
+        : {
+            audio: {
+              echoCancellation: enableFullDuplex,
+              noiseSuppression: enableFullDuplex,
+              autoGainControl: enableFullDuplex
+            }
+          }
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       const recorder = new MediaRecorder(stream, { mimeType })
       mediaRecorderRef.current = recorder
@@ -634,16 +1130,22 @@ const App = () => {
         }
       }
       source.connect(processor)
-      processor.connect(audioCtx.destination)
+      // Use zero-gain node to keep processor alive without routing mic to speakers
+      const silentGain = audioCtx.createGain()
+      silentGain.gain.value = 0
+      processor.connect(silentGain)
+      silentGain.connect(audioCtx.destination)
       audioContextRef.current = audioCtx
       analyserRef.current = analyser
       processorRef.current = processor
       sampleRateRef.current = audioCtx.sampleRate || 44100
 
       const data = new Float32Array(analyser.fftSize)
-      const thresholdRms = 0.025
+      const baseThresholdRms = 0.025
       const minVoiceMs = 150
-      const maxSilenceMs = 2300 // wait ~2-3 seconds of silence before sending
+      const maxSilenceMs = import.meta.env.VITE_MAX_SILENCE_MS
+        ? parseInt(import.meta.env.VITE_MAX_SILENCE_MS)
+        : 800 // Reduced from 2300ms to 800ms for faster turn completion
       const interval = 50
 
       vadTimerRef.current = window.setInterval(() => {
@@ -652,6 +1154,8 @@ const App = () => {
         let sum = 0
         for (let i = 0; i < data.length; i++) sum += data[i] * data[i]
         const rms = Math.sqrt(sum / data.length)
+        // Use dynamic threshold: raise it during AI playback to reduce false positives
+        const thresholdRms = isPlaying ? baseThresholdRms * 1.5 : baseThresholdRms
         const speaking = rms > thresholdRms
 
         // Update equalizer visualization
@@ -671,6 +1175,76 @@ const App = () => {
           barValues.push(normalized)
         }
         setAudioLevels(barValues)
+
+        // Volume ducking: reduce AI audio volume when user is speaking
+        const enableDucking = import.meta.env.VITE_ENABLE_DUCKING === 'true' || false
+        const duckVolume = import.meta.env.VITE_DUCK_VOLUME
+          ? parseFloat(import.meta.env.VITE_DUCK_VOLUME)
+          : 0.15
+
+        if (enableDucking && isPlaying) {
+          // Duck volume for either HTMLAudio or PCMStreamPlayer
+          if (pcmStreamPlayerRef.current) {
+            // Streaming TTS path - use gain node
+            if (speaking) {
+              const currentVolume = pcmStreamPlayerRef.current.getVolume()
+              if (currentVolume > duckVolume) {
+                pcmStreamPlayerRef.current.setVolume(Math.max(duckVolume, currentVolume - 0.05))
+              }
+            } else {
+              const currentVolume = pcmStreamPlayerRef.current.getVolume()
+              if (currentVolume < 1.0) {
+                pcmStreamPlayerRef.current.setVolume(Math.min(1.0, currentVolume + 0.05))
+              }
+            }
+          } else if (currentAudioRef.current) {
+            // Non-streaming TTS path - use HTMLAudio volume
+            if (speaking) {
+              const currentVolume = currentAudioRef.current.volume
+              if (currentVolume > duckVolume) {
+                currentAudioRef.current.volume = Math.max(duckVolume, currentVolume - 0.05)
+              }
+            } else {
+              const currentVolume = currentAudioRef.current.volume
+              if (currentVolume < 1.0) {
+                currentAudioRef.current.volume = Math.min(1.0, currentVolume + 0.05)
+              }
+            }
+          }
+        }
+
+        // Barge-in: interrupt AI when user speaks over it
+        const enableBargeIn = import.meta.env.VITE_ENABLE_BARGE_IN === 'true' || false
+        const bargeInThresholdMs = 300 // Require 300ms of sustained speech to trigger barge-in
+
+        if (enableBargeIn && isPlaying && speaking && voiceMsRef.current >= bargeInThresholdMs) {
+          console.log('[Barge-in] User interrupted AI')
+
+          // Abort in-flight requests
+          if (chatAbortControllerRef.current) {
+            chatAbortControllerRef.current.abort()
+            chatAbortControllerRef.current = null
+          }
+          if (ttsAbortControllerRef.current) {
+            ttsAbortControllerRef.current.abort()
+            ttsAbortControllerRef.current = null
+          }
+
+          // Stop audio playback
+          if (currentAudioRef.current) {
+            currentAudioRef.current.pause()
+            currentAudioRef.current = null
+          }
+
+          // Stop streaming audio if using streaming TTS
+          if (pcmStreamPlayerRef.current) {
+            pcmStreamPlayerRef.current.stop()
+          }
+
+          setIsPlaying(false)
+          setPlayingMessageId(null)
+          setStatus('Interrupted. Listening...')
+        }
 
         if (speaking) {
           voiceMsRef.current += interval
@@ -740,7 +1314,7 @@ const App = () => {
       setStatus(null)
       resetRecorder()
     }
-  }, [handleRecordedAudio, isProcessing, mimeType, resetRecorder, selectedMicId, refreshDevices])
+  }, [handleRecordedAudio, mimeType, resetRecorder, selectedMicId, refreshDevices])
 
   // Auto start/refresh when selection changes
   useEffect(() => {
@@ -806,6 +1380,24 @@ const App = () => {
                   <div className="message-status error">
                     Voice response failed. Try sending another message.
                   </div>
+                )}
+                {autoplayBlockedMessageId === message.id && message.audioUrl && (
+                  <button
+                    className="play-button"
+                    onClick={() => handleManualPlay(message.id)}
+                    style={{
+                      marginTop: '8px',
+                      padding: '8px 16px',
+                      backgroundColor: '#4CAF50',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      fontSize: '14px',
+                    }}
+                  >
+                    ▶️ Play Audio
+                  </button>
                 )}
               </article>
             ))

@@ -1,0 +1,16 @@
+{
+  "name": "cartesia-tts-tests",
+  "version": "1.0.0",
+  "description": "Automated tests for voice chat application",
+  "scripts": {
+    "test": "node conversation-test.js",
+    "test:quick": "node quick-test.js",
+    "test:verbose": "node conversation-test.js --verbose",
+    "test:json": "node conversation-test.js --json",
+    "test:10": "node conversation-test.js --exchanges 10"
+  },
+  "keywords": ["test", "voice", "chat", "stt", "tts"],
+  "author": "",
+  "license": "ISC"
+}
+

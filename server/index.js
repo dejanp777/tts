@@ -64,15 +64,26 @@ app.get('/health', (_req, res) => {
 });
 
 function extractTranscript(data) {
-  if (!data) return '';
+  if (!data) {
+    console.log('[extractTranscript] No data provided');
+    return '';
+  }
+
+  console.log('[extractTranscript] Received data keys:', Object.keys(data));
+  console.log('[extractTranscript] Full data:', JSON.stringify(data).substring(0, 1000));
+
+  // Cartesia STT API returns { text: "...", duration: ..., language: "..." }
   const take = (v) => (typeof v === 'string' ? v : '');
   let t =
-    take(data.transcript) ||
-    take(data.text) ||
+    take(data.text) ||           // Cartesia STT primary field
+    take(data.transcript) ||     // Fallback
     take(data?.result?.text) ||
     take(data?.output?.text) ||
     take(data?.data?.text);
-  if (t && t.trim()) return t.trim();
+  if (t && t.trim()) {
+    console.log('[extractTranscript] Found transcript:', t.trim());
+    return t.trim();
+  }
   // Join common array shapes
   const arrays = [
     data.segments,
@@ -86,8 +97,12 @@ function extractTranscript(data) {
       .map((s) => (typeof s === 'string' ? s : (s && (s.text || s.transcript || s.caption)) || ''))
       .join(' ')
       .trim();
-    if (joined) return joined;
+    if (joined) {
+      console.log('[extractTranscript] Found transcript from array:', joined);
+      return joined;
+    }
   }
+  console.log('[extractTranscript] No transcript found in data');
   return '';
 }
 
@@ -121,6 +136,9 @@ async function transcodeToWavPcm16Mono(inputBuffer) {
 }
 
 app.post('/api/stt', upload.single('audio'), async (req, res) => {
+  const sttStartTime = Date.now();
+  console.log(`⏱️ [TIMING] STT request started (file size: ${req.file?.size || 0} bytes)`);
+
   try {
     if (!CARTESIA_API_KEY) {
       return res.status(500).json({ error: 'Cartesia API key not configured' });
@@ -197,7 +215,7 @@ app.post('/api/stt', upload.single('audio'), async (req, res) => {
       if (language && language.toLowerCase() !== 'auto' && text && /alias.*not supported.*language/i.test(text)) {
         try {
           const retryForm = new FormData();
-          retryForm.append('file', Buffer.from(audioBase64, 'base64'), {
+          retryForm.append('file', wavBuffer, {
             filename: 'audio.wav',
             contentType: 'audio/wav',
           });
@@ -234,6 +252,13 @@ app.post('/api/stt', upload.single('audio'), async (req, res) => {
     }
 
     const transcript = extractTranscript(response.data);
+
+    const sttEndTime = Date.now();
+    const totalTime = sttEndTime - sttStartTime;
+    console.log(`⏱️ [TIMING] STT complete took ${totalTime}ms`);
+
+    console.log('[stt] Cartesia response:', JSON.stringify(response.data).substring(0, 500));
+    console.log('[stt] Extracted transcript:', transcript);
 
     res.json({
       transcript,
@@ -295,6 +320,195 @@ app.post('/api/chat', async (req, res) => {
       error: 'Failed to fetch chat completion',
       details: error.response?.data || error.message,
     });
+  }
+});
+
+// Streaming chat endpoint (SSE)
+app.post('/api/chat/stream', async (req, res) => {
+  try {
+    if (!OPENROUTER_API_KEY) {
+      return res.status(500).json({ error: 'OpenRouter API key not configured' });
+    }
+
+    const { messages, temperature = 0.7, top_p = 0.95 } = req.body || {};
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required' });
+    }
+
+    const fullMessages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...messages,
+    ];
+
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders(); // Flush headers immediately for better streaming
+
+    const chatStartTime = Date.now();
+    console.log('⏱️ [TIMING] Chat stream request started');
+
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: OPENROUTER_MODEL,
+        messages: fullMessages,
+        temperature,
+        top_p,
+        stream: true,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': OPENROUTER_SITE_URL,
+          'X-Title': OPENROUTER_SITE_NAME,
+        },
+        timeout: 60000,
+        responseType: 'stream',
+      }
+    );
+
+    // Handle client disconnect to clean up upstream
+    req.on('close', () => {
+      console.log('[chat/stream] client disconnected, destroying upstream');
+      response.data.destroy();
+    });
+
+    // Forward SSE events from OpenRouter to client
+    let firstChunkReceived = false;
+    response.data.on('data', (chunk) => {
+      if (!firstChunkReceived) {
+        firstChunkReceived = true;
+        const firstChunkTime = Date.now() - chatStartTime;
+        console.log(`⏱️ [TIMING] Chat first chunk from OpenRouter took ${firstChunkTime}ms`);
+      }
+      res.write(chunk);
+    });
+
+    response.data.on('end', () => {
+      const totalTime = Date.now() - chatStartTime;
+      console.log(`⏱️ [TIMING] Chat stream complete took ${totalTime}ms`);
+      res.end();
+    });
+
+    response.data.on('error', (err) => {
+      console.error('[chat/stream] error', err.message);
+      res.end();
+    });
+
+  } catch (error) {
+    console.error('[chat/stream] error', error.response?.data || error.message);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'Failed to fetch streaming chat completion',
+        details: error.response?.data || error.message,
+      });
+    }
+  }
+});
+
+// Streaming TTS endpoint (SSE)
+app.post('/api/tts/stream', async (req, res) => {
+  try {
+    if (!CARTESIA_API_KEY) {
+      return res.status(500).json({ error: 'Cartesia API key not configured' });
+    }
+
+    const TESSA_VOICE_ID = '6ccbfb76-1fc6-48f7-b71d-91ac6298247b';
+
+    const {
+      text,
+      voiceId = TESSA_VOICE_ID,
+      emotion = 'frustrated'
+    } = req.body || {};
+
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ error: 'text is required' });
+    }
+
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const ttsStartTime = Date.now();
+    console.log(`⏱️ [TIMING] TTS stream request started (text length: ${text.length} chars)`);
+
+    try {
+      const response = await axios.post(
+        'https://api.cartesia.ai/tts/sse',
+        {
+          model_id: CARTESIA_TTS_MODEL,
+          transcript: text,
+          voice: { mode: 'id', id: voiceId },
+          output_format: {
+            container: 'raw',
+            encoding: 'pcm_f32le',
+            sample_rate: 44100
+          },
+          generation_config: { emotion }
+        },
+        {
+          headers: {
+            'X-API-Key': CARTESIA_API_KEY,
+            'Cartesia-Version': CARTESIA_VERSION,
+            'Content-Type': 'application/json'
+          },
+          responseType: 'stream',
+          timeout: 60000
+        }
+      );
+
+      // Forward SSE events from Cartesia to client
+      let chunkCount = 0;
+      let firstChunkReceived = false;
+      response.data.on('data', (chunk) => {
+        chunkCount++;
+        if (!firstChunkReceived) {
+          firstChunkReceived = true;
+          const firstChunkTime = Date.now() - ttsStartTime;
+          console.log(`⏱️ [TIMING] TTS first chunk from Cartesia took ${firstChunkTime}ms`);
+        }
+        if (chunkCount <= 2) {
+          // Log first 2 chunks to see the format
+          console.log(`[tts/stream] Chunk ${chunkCount}:`, chunk.toString().substring(0, 200));
+        }
+        res.write(chunk);
+      });
+
+      response.data.on('end', () => {
+        const totalTime = Date.now() - ttsStartTime;
+        console.log(`⏱️ [TIMING] TTS stream complete took ${totalTime}ms (${chunkCount} chunks)`);
+        res.end();
+      });
+
+      response.data.on('error', (err) => {
+        console.error('[tts/stream] upstream error', err.message);
+        res.end();
+      });
+
+      // Handle client disconnect
+      req.on('close', () => {
+        response.data.destroy();
+      });
+
+    } catch (error) {
+      console.error('[tts/stream] error', error.response?.data || error.message);
+      res.write(`data: ${JSON.stringify({ error: 'Stream failed' })}\n\n`);
+      res.end();
+    }
+  } catch (error) {
+    console.error('[tts/stream] outer error', error.message);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'Failed to initialize streaming TTS',
+        details: error.message,
+      });
+    }
   }
 });
 
