@@ -97,12 +97,12 @@ export class ContextAwareThreshold {
 
     // Factor 6: Background noise level
     if (context.noiseLevel !== undefined) {
-      if (context.noiseLevel > 0.3) {
-        threshold *= 1.2  // Longer with noise
-        adjustmentLog.push('Noisy environment (+20%)')
-      } else if (context.noiseLevel > 0.5) {
+      if (context.noiseLevel > 0.5) {
         threshold *= 1.4  // Much longer with high noise
         adjustmentLog.push('High noise (+40%)')
+      } else if (context.noiseLevel > 0.3) {
+        threshold *= 1.2  // Longer with noise
+        adjustmentLog.push('Noisy environment (+20%)')
       }
     }
 
