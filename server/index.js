@@ -653,6 +653,41 @@ app.post('/api/tts/generate-fillers', async (req, res) => {
   }
 });
 
+// Phase 2: Turn-taking prediction endpoint
+const TurnTakingFusion = require('./turn-taking/fusion');
+const turnTaking = new TurnTakingFusion();
+
+app.post('/api/turn-prediction', async (req, res) => {
+  try {
+    const {
+      transcript,
+      audioFeatures,
+      silenceDuration,
+      fallbackThreshold = 1500
+    } = req.body || {};
+
+    if (!silenceDuration && silenceDuration !== 0) {
+      return res.status(400).json({ error: 'silenceDuration is required' });
+    }
+
+    // Make turn-taking decision
+    const decision = turnTaking.decide({
+      transcript,
+      audioFeatures,
+      silenceDuration,
+      fallbackThreshold
+    });
+
+    res.json(decision);
+  } catch (error) {
+    console.error('[turn-prediction] error', error.message);
+    res.status(500).json({
+      error: 'Failed to predict turn-taking',
+      details: error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
 });
