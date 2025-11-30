@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import './App.css'
+import { SettingsPanel } from './components/SettingsPanel'
+import { classifyUserAudio as classifyBackchannel, extractAudioFeatures } from './utils/backchannels'
+import { ThinkingFillerManager } from './utils/thinkingFillers'
+import { detectMessageType, selectProsody, type ProsodyProfile } from './utils/prosody'
 
 type ChatMessage = {
   id: string
@@ -125,12 +129,6 @@ class PCMStreamPlayer {
 }
 
 const App = () => {
-  // Log API configuration on mount
-  useEffect(() => {
-    console.log('[CONFIG] API_BASE:', API_BASE || '(relative URLs)')
-    console.log('[CONFIG] Current origin:', window.location.origin)
-  }, [])
-
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [inputValue, setInputValue] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
@@ -141,6 +139,23 @@ const App = () => {
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null) // Track which message is playing
   const [audioLevels, setAudioLevels] = useState<number[]>([0, 0, 0, 0, 0]) // Audio equalizer bars
   const [autoplayBlockedMessageId, setAutoplayBlockedMessageId] = useState<string | null>(null) // Track message that needs manual play
+
+  // User preference state for Phase 1.2
+  const [userSilenceThreshold, setUserSilenceThreshold] = useState(() => {
+    const saved = localStorage.getItem('silenceThreshold')
+    return saved ? parseInt(saved) : 1500
+  })
+  const [backchannelsEnabled, setBackchannelsEnabled] = useState(() => {
+    const saved = localStorage.getItem('backchannelsEnabled')
+    return saved ? saved === 'true' : true
+  })
+
+  // Log API configuration on mount
+  useEffect(() => {
+    console.log('[CONFIG] API_BASE:', API_BASE || '(relative URLs)')
+    console.log('[CONFIG] Current origin:', window.location.origin)
+    console.log('[CONFIG] Backchannels enabled:', backchannelsEnabled)
+  }, [backchannelsEnabled])
 
   const messagesRef = useRef<ChatMessage[]>([])
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null)
@@ -621,9 +636,9 @@ const App = () => {
     []
   )
 
-  const synthesizeSpeech = useCallback(async (text: string) => {
+  const synthesizeSpeech = useCallback(async (text: string, prosody?: ProsodyProfile) => {
     const url = `${API_BASE}/api/tts`
-    console.log('[API] Requesting TTS:', url)
+    console.log('[API] Requesting TTS:', url, 'prosody:', prosody)
 
     // Create abort controller for this request
     const controller = new AbortController()
@@ -632,7 +647,11 @@ const App = () => {
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        emotion: prosody?.emotion || 'frustrated',
+        speed: prosody?.speed || 1.0
+      }),
       signal: controller.signal,
     })
 
@@ -656,18 +675,41 @@ const App = () => {
   // PCM Stream Player for streaming TTS
   const pcmStreamPlayerRef = useRef<PCMStreamPlayer | null>(null)
 
+  // Phase 1.5: Thinking Filler Manager
+  const fillerManagerRef = useRef<ThinkingFillerManager>(
+    new ThinkingFillerManager({
+      enabled: backchannelsEnabled,
+      thresholdMs: 1500,
+      minInterval: 5000 // Max 1 filler per 5 seconds
+    })
+  )
+
+  // Update filler manager when user preference changes
+  useEffect(() => {
+    fillerManagerRef.current = new ThinkingFillerManager({
+      enabled: backchannelsEnabled,
+      thresholdMs: 1500,
+      minInterval: 5000
+    })
+  }, [backchannelsEnabled])
+
   const synthesizeSpeechStream = useCallback(async (
     text: string,
     onChunk: (pcmData: Float32Array) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    prosody?: ProsodyProfile
   ) => {
     const url = `${API_BASE}/api/tts/stream`
-    console.log('[API] Requesting streaming TTS:', url, 'text length:', text.length)
+    console.log('[API] Requesting streaming TTS:', url, 'text length:', text.length, 'prosody:', prosody)
 
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        emotion: prosody?.emotion || 'frustrated',
+        speed: prosody?.speed || 1.0
+      }),
       signal,
     })
 
@@ -803,6 +845,22 @@ const App = () => {
 
       setStatus('Thinking...')
 
+      // Phase 1.5: Set up thinking filler
+      let fillerTimeout: number | null = null
+
+      const fillerUrl = fillerManagerRef.current.selectFiller(trimmed)
+
+      if (fillerUrl) {
+        fillerTimeout = window.setTimeout(async () => {
+          try {
+            console.log('[Filler] Playing thinking filler:', fillerUrl)
+            await fillerManagerRef.current.playFiller(fillerUrl)
+          } catch (err) {
+            console.error('[Filler] Failed to play:', err)
+          }
+        }, fillerManagerRef.current['options'].thresholdMs)
+      }
+
       try {
         const enableChatStream = import.meta.env.VITE_ENABLE_CHAT_STREAM === 'true' || false
         let assistantText = ''
@@ -864,6 +922,11 @@ const App = () => {
           setMessages(conversationWithAssistant)
         }
 
+        // Clear filler timeout once we have response
+        if (fillerTimeout) {
+          window.clearTimeout(fillerTimeout)
+        }
+
         setStatus('Generating voice...')
 
         if (ENABLE_TTS_STREAM) {
@@ -904,6 +967,11 @@ const App = () => {
           const ttsController = new AbortController()
           ttsAbortControllerRef.current = ttsController
 
+          // Phase 1.6: Detect message type and select appropriate prosody
+          const messageType = detectMessageType(assistantText)
+          const prosody = selectProsody(messageType, assistantText)
+          console.log('[Prosody] Selected:', { messageType, prosody })
+
           let firstChunkTime: number | null = null
           // Stream and play audio chunks
           await synthesizeSpeechStream(
@@ -915,7 +983,8 @@ const App = () => {
               }
               player.addChunk(pcmData)
             },
-            ttsController.signal
+            ttsController.signal,
+            prosody
           )
 
           const ttsEndTime = performance.now()
@@ -931,7 +1000,12 @@ const App = () => {
           setStatus(null)
         } else {
           // Use non-streaming TTS (original behavior)
-          const audioUrl = await synthesizeSpeech(assistantText)
+          // Phase 1.6: Detect message type and select appropriate prosody
+          const messageType = detectMessageType(assistantText)
+          const prosody = selectProsody(messageType, assistantText)
+          console.log('[Prosody] Selected:', { messageType, prosody })
+
+          const audioUrl = await synthesizeSpeech(assistantText, prosody)
 
           const finalizedMessages = messagesRef.current.map((entry) =>
             entry.id === assistantId ? { ...entry, audioUrl, status: 'complete' as const } : entry
@@ -943,6 +1017,11 @@ const App = () => {
         }
       } catch (err) {
         console.error(err)
+
+        // Clear filler timeout on error
+        if (fillerTimeout) {
+          window.clearTimeout(fillerTimeout)
+        }
 
         // Handle AbortError gracefully (from barge-in)
         if (err instanceof Error && err.name === 'AbortError') {
@@ -1143,9 +1222,8 @@ const App = () => {
       const data = new Float32Array(analyser.fftSize)
       const baseThresholdRms = 0.025
       const minVoiceMs = 150
-      const maxSilenceMs = import.meta.env.VITE_MAX_SILENCE_MS
-        ? parseInt(import.meta.env.VITE_MAX_SILENCE_MS)
-        : 800 // Reduced from 2300ms to 800ms for faster turn completion
+      // Use user preference for silence threshold (Phase 1.2)
+      const maxSilenceMs = userSilenceThreshold
       const interval = 50
 
       vadTimerRef.current = window.setInterval(() => {
@@ -1176,74 +1254,129 @@ const App = () => {
         }
         setAudioLevels(barValues)
 
-        // Volume ducking: reduce AI audio volume when user is speaking
+        // Phase 1.3: Graduated audio ducking with 4 levels
         const enableDucking = import.meta.env.VITE_ENABLE_DUCKING === 'true' || false
-        const duckVolume = import.meta.env.VITE_DUCK_VOLUME
-          ? parseFloat(import.meta.env.VITE_DUCK_VOLUME)
-          : 0.15
+
+        // Classify user audio to determine ducking level
+        const classifyUserAudio = (
+          duration: number,
+          intensity: number,
+          speaking: boolean
+        ): 'NONE' | 'BACKCHANNEL' | 'TENTATIVE' | 'CLEAR' => {
+          if (!speaking) return 'NONE'
+
+          // Short, quiet sounds = backchannel ("mm-hmm")
+          if (duration < 800 && intensity < 0.03) {
+            return 'BACKCHANNEL'
+          }
+
+          // Low intensity but longer = tentative speech
+          if (intensity < 0.04) {
+            return 'TENTATIVE'
+          }
+
+          // Strong, sustained speech = clear interruption
+          return 'CLEAR'
+        }
+
+        const getDuckVolume = (classification: string): number => {
+          switch (classification) {
+            case 'BACKCHANNEL': return 0.80  // Minimal ducking
+            case 'TENTATIVE': return 0.50    // Moderate ducking
+            case 'CLEAR': return 0.20        // Strong ducking
+            default: return 1.0              // No ducking
+          }
+        }
 
         if (enableDucking && isPlaying) {
-          // Duck volume for either HTMLAudio or PCMStreamPlayer
+          // Classify the current user audio
+          const classification = classifyUserAudio(
+            voiceMsRef.current,
+            rms,
+            speaking
+          )
+
+          const targetVolume = getDuckVolume(classification)
+
+          // Smooth transition to target volume (300ms fade)
+          const step = 0.05
+
           if (pcmStreamPlayerRef.current) {
-            // Streaming TTS path - use gain node
-            if (speaking) {
-              const currentVolume = pcmStreamPlayerRef.current.getVolume()
-              if (currentVolume > duckVolume) {
-                pcmStreamPlayerRef.current.setVolume(Math.max(duckVolume, currentVolume - 0.05))
-              }
-            } else {
-              const currentVolume = pcmStreamPlayerRef.current.getVolume()
-              if (currentVolume < 1.0) {
-                pcmStreamPlayerRef.current.setVolume(Math.min(1.0, currentVolume + 0.05))
-              }
+            const currentVolume = pcmStreamPlayerRef.current.getVolume()
+            if (Math.abs(currentVolume - targetVolume) > 0.01) {
+              const newVolume = currentVolume < targetVolume
+                ? Math.min(targetVolume, currentVolume + step)
+                : Math.max(targetVolume, currentVolume - step)
+              pcmStreamPlayerRef.current.setVolume(newVolume)
             }
           } else if (currentAudioRef.current) {
-            // Non-streaming TTS path - use HTMLAudio volume
-            if (speaking) {
-              const currentVolume = currentAudioRef.current.volume
-              if (currentVolume > duckVolume) {
-                currentAudioRef.current.volume = Math.max(duckVolume, currentVolume - 0.05)
-              }
-            } else {
-              const currentVolume = currentAudioRef.current.volume
-              if (currentVolume < 1.0) {
-                currentAudioRef.current.volume = Math.min(1.0, currentVolume + 0.05)
-              }
+            const currentVolume = currentAudioRef.current.volume
+            if (Math.abs(currentVolume - targetVolume) > 0.01) {
+              const newVolume = currentVolume < targetVolume
+                ? Math.min(targetVolume, currentVolume + step)
+                : Math.max(targetVolume, currentVolume - step)
+              currentAudioRef.current.volume = newVolume
             }
           }
         }
 
-        // Barge-in: interrupt AI when user speaks over it
+        // Phase 1.4: Barge-in with backchannel detection
         const enableBargeIn = import.meta.env.VITE_ENABLE_BARGE_IN === 'true' || false
         const bargeInThresholdMs = 300 // Require 300ms of sustained speech to trigger barge-in
 
-        if (enableBargeIn && isPlaying && speaking && voiceMsRef.current >= bargeInThresholdMs) {
-          console.log('[Barge-in] User interrupted AI')
+        if (enableBargeIn && isPlaying && speaking) {
+          // Extract audio features for classification
+          const audioFeatures = extractAudioFeatures(
+            data,
+            audioContextRef.current?.sampleRate || 44100,
+            voiceMsRef.current
+          )
 
-          // Abort in-flight requests
-          if (chatAbortControllerRef.current) {
-            chatAbortControllerRef.current.abort()
-            chatAbortControllerRef.current = null
-          }
-          if (ttsAbortControllerRef.current) {
-            ttsAbortControllerRef.current.abort()
-            ttsAbortControllerRef.current = null
-          }
+          // Classify the audio (backchannel vs. interruption)
+          const backchannelClassification = classifyBackchannel(audioFeatures, isPlaying)
 
-          // Stop audio playback
-          if (currentAudioRef.current) {
-            currentAudioRef.current.pause()
-            currentAudioRef.current = null
-          }
+          console.log('[Audio Classification]', {
+            type: backchannelClassification.type,
+            confidence: backchannelClassification.confidence,
+            features: audioFeatures,
+            aiSpeaking: isPlaying
+          })
 
-          // Stop streaming audio if using streaming TTS
-          if (pcmStreamPlayerRef.current) {
-            pcmStreamPlayerRef.current.stop()
-          }
+          // Only trigger barge-in for real interruptions, not backchannels
+          if (backchannelClassification.type === 'INTERRUPTION' &&
+              backchannelClassification.confidence > 0.7 &&
+              voiceMsRef.current >= bargeInThresholdMs) {
 
-          setIsPlaying(false)
-          setPlayingMessageId(null)
-          setStatus('Interrupted. Listening...')
+            console.log('[Barge-in] User interrupted AI (not a backchannel)')
+
+            // Abort in-flight requests
+            if (chatAbortControllerRef.current) {
+              chatAbortControllerRef.current.abort()
+              chatAbortControllerRef.current = null
+            }
+            if (ttsAbortControllerRef.current) {
+              ttsAbortControllerRef.current.abort()
+              ttsAbortControllerRef.current = null
+            }
+
+            // Stop audio playback
+            if (currentAudioRef.current) {
+              currentAudioRef.current.pause()
+              currentAudioRef.current = null
+            }
+
+            // Stop streaming audio if using streaming TTS
+            if (pcmStreamPlayerRef.current) {
+              pcmStreamPlayerRef.current.stop()
+            }
+
+            setIsPlaying(false)
+            setPlayingMessageId(null)
+            setStatus('Interrupted. Listening...')
+          } else if (backchannelClassification.type === 'BACKCHANNEL') {
+            console.log('[Backchannel] Detected, not interrupting AI')
+            // Don't interrupt, just acknowledge in logs
+          }
         }
 
         if (speaking) {
@@ -1314,7 +1447,7 @@ const App = () => {
       setStatus(null)
       resetRecorder()
     }
-  }, [handleRecordedAudio, mimeType, resetRecorder, selectedMicId, refreshDevices])
+  }, [handleRecordedAudio, mimeType, resetRecorder, selectedMicId, refreshDevices, userSilenceThreshold, isPlaying])
 
   // Auto start/refresh when selection changes
   useEffect(() => {
@@ -1352,6 +1485,11 @@ const App = () => {
             Clear
           </button>
         </header>
+
+        <SettingsPanel
+          onSilenceThresholdChange={setUserSilenceThreshold}
+          onBackchannelsEnabledChange={setBackchannelsEnabled}
+        />
 
         <section className="messages">
           {messages.length === 0 ? (

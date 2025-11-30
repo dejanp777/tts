@@ -422,6 +422,7 @@ app.post('/api/tts/stream', async (req, res) => {
     const {
       text,
       voiceId = TESSA_VOICE_ID,
+      speed = 1.0, // Phase 1.6: Accept numeric speed
       emotion = 'frustrated'
     } = req.body || {};
 
@@ -436,7 +437,7 @@ app.post('/api/tts/stream', async (req, res) => {
     res.flushHeaders();
 
     const ttsStartTime = Date.now();
-    console.log(`⏱️ [TIMING] TTS stream request started (text length: ${text.length} chars)`);
+    console.log(`⏱️ [TIMING] TTS stream request started (text length: ${text.length} chars, emotion: ${emotion}, speed: ${speed})`);
 
     try {
       const response = await axios.post(
@@ -450,7 +451,11 @@ app.post('/api/tts/stream', async (req, res) => {
             encoding: 'pcm_f32le',
             sample_rate: 44100
           },
-          generation_config: { emotion }
+          generation_config: {
+            emotion,
+            speed,
+            volume: 1
+          }
         },
         {
           headers: {
@@ -524,13 +529,15 @@ app.post('/api/tts', async (req, res) => {
     const {
       text,
       voiceId = TESSA_VOICE_ID,
-      speed = 'normal',
+      speed = 1.0, // Phase 1.6: Accept numeric speed (0.5-2.0)
       emotion = 'frustrated' // Default emotion for angry secretary
     } = req.body || {};
 
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ error: 'text is required' });
     }
+
+    console.log('[TTS] Generating with emotion:', emotion, 'speed:', speed);
 
     const payload = {
       model_id: CARTESIA_TTS_MODEL,
@@ -544,11 +551,10 @@ app.post('/api/tts', async (req, res) => {
         encoding: 'pcm_f32le',
         sample_rate: 44100,
       },
-      speed,
       generation_config: {
-        speed: 1,
+        speed: speed, // Use dynamic speed from client
         volume: 1,
-        emotion: emotion, // Add emotion control for angry secretary character
+        emotion: emotion, // Use dynamic emotion from client
       },
     };
 
@@ -572,6 +578,76 @@ app.post('/api/tts', async (req, res) => {
     console.error('[tts] error', error.response?.data || error.message);
     res.status(500).json({
       error: 'Failed to synthesize speech',
+      details: error.response?.data || error.message,
+    });
+  }
+});
+
+// Phase 1.5: Generate thinking filler audio files
+app.post('/api/tts/generate-fillers', async (req, res) => {
+  try {
+    if (!CARTESIA_API_KEY) {
+      return res.status(500).json({ error: 'Cartesia API key not configured' });
+    }
+
+    const TESSA_VOICE_ID = '6ccbfb76-1fc6-48f7-b71d-91ac6298247b';
+
+    const fillers = [
+      { text: 'hmm', emotion: 'thoughtful', filename: 'hmm.mp3' },
+      { text: 'let me see', emotion: 'thoughtful', filename: 'let-me-see.mp3' },
+      { text: 'let me think about that', emotion: 'thoughtful', filename: 'let-me-think.mp3' },
+      { text: 'okay', emotion: 'neutral', filename: 'okay.mp3' },
+      { text: 'I see', emotion: 'understanding', filename: 'i-see.mp3' },
+      { text: 'right', emotion: 'neutral', filename: 'right.mp3' },
+      { text: 'so', emotion: 'neutral', filename: 'so.mp3' },
+      { text: 'well', emotion: 'thoughtful', filename: 'well.mp3' }
+    ];
+
+    const generatedFillers = [];
+
+    for (const filler of fillers) {
+      try {
+        const response = await axios.post('https://api.cartesia.ai/tts/bytes', {
+          model_id: CARTESIA_TTS_MODEL,
+          transcript: filler.text,
+          voice: { mode: 'id', id: TESSA_VOICE_ID },
+          output_format: {
+            container: 'mp3',
+            encoding: 'mp3',
+            sample_rate: 22050
+          },
+          generation_config: {
+            speed: 0.95, // Slightly slower
+            emotion: filler.emotion
+          }
+        }, {
+          headers: {
+            'X-API-Key': CARTESIA_API_KEY,
+            'Cartesia-Version': CARTESIA_VERSION,
+            'Content-Type': 'application/json',
+          },
+          responseType: 'arraybuffer',
+          timeout: 60000,
+        });
+
+        const audioBase64 = Buffer.from(response.data).toString('base64');
+
+        generatedFillers.push({
+          filename: filler.filename,
+          audio: `data:audio/mp3;base64,${audioBase64}`
+        });
+
+        console.log(`[generate-fillers] Generated: ${filler.filename}`);
+      } catch (err) {
+        console.error(`[generate-fillers] Error generating ${filler.filename}:`, err.message);
+      }
+    }
+
+    res.json({ fillers: generatedFillers });
+  } catch (error) {
+    console.error('[generate-fillers] error', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Failed to generate fillers',
       details: error.response?.data || error.message,
     });
   }
