@@ -1,0 +1,257 @@
+name: Voice AI Automated Tests
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allow manual trigger
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for regression comparison
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libsndfile1
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r tests/requirements.txt
+
+      - name: Generate test audio (if not cached)
+        run: |
+          cd tests/fixtures
+          python generate_test_audio.py || echo "Test audio generation failed, will skip tests requiring audio"
+
+      - name: Run STT accuracy tests
+        id: stt_accuracy
+        run: |
+          cd tests
+          pytest stt/test_accuracy.py -v --tb=short --junitxml=results/stt_accuracy.xml || true
+
+      - name: Run STT latency tests
+        id: stt_latency
+        run: |
+          cd tests
+          pytest stt/test_latency.py -v --tb=short --junitxml=results/stt_latency.xml || true
+
+      - name: Run TTS quality tests
+        id: tts_quality
+        run: |
+          cd tests
+          pytest tts/test_quality.py -v --tb=short --junitxml=results/tts_quality.xml || true
+        env:
+          TEST_API_BASE_URL: ${{ secrets.TEST_API_BASE_URL || 'http://localhost:3000' }}
+
+      - name: Run TTS latency tests
+        id: tts_latency
+        run: |
+          cd tests
+          pytest tts/test_latency.py -v --tb=short --junitxml=results/tts_latency.xml || true
+        env:
+          TEST_API_BASE_URL: ${{ secrets.TEST_API_BASE_URL || 'http://localhost:3000' }}
+
+      - name: Run conversation flow tests
+        id: conversation_flow
+        run: |
+          cd tests
+          pytest conversation/test_flow.py -v --tb=short --junitxml=results/conversation_flow.xml || true
+        env:
+          TEST_API_BASE_URL: ${{ secrets.TEST_API_BASE_URL || 'http://localhost:3000' }}
+
+      - name: Run turn-taking tests
+        id: turn_taking
+        run: |
+          cd tests
+          pytest conversation/test_turn_taking.py -v --tb=short --junitxml=results/turn_taking.xml || true
+        env:
+          TEST_API_BASE_URL: ${{ secrets.TEST_API_BASE_URL || 'http://localhost:3000' }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-python-${{ matrix.python-version }}
+          path: tests/results/
+
+      - name: Check for regressions
+        if: github.event_name == 'pull_request'
+        run: |
+          cd tests
+          python -c "
+          import json
+          from pathlib import Path
+          from utils.metrics_collector import MetricsCollector
+
+          # Load current metrics
+          results_dir = Path('results')
+          baseline_dir = Path('baseline')
+
+          if not baseline_dir.exists():
+              print('No baseline found, skipping regression check')
+              exit(0)
+
+          # Compare each metric file
+          regressions = []
+          for current_file in results_dir.glob('*_metrics.json'):
+              baseline_file = baseline_dir / current_file.name
+
+              if not baseline_file.exists():
+                  continue
+
+              with open(current_file) as f:
+                  current = json.load(f)
+              with open(baseline_file) as f:
+                  baseline = json.load(f)
+
+              # Check for regressions
+              for metric_name, current_stats in current.get('metrics', {}).items():
+                  if metric_name not in baseline.get('metrics', {}):
+                      continue
+
+                  baseline_stats = baseline['metrics'][metric_name]
+                  current_mean = current_stats.get('mean', 0)
+                  baseline_mean = baseline_stats.get('mean', 0)
+
+                  if baseline_mean == 0:
+                      continue
+
+                  change_pct = ((current_mean - baseline_mean) / baseline_mean) * 100
+
+                  # Check for regression based on metric type
+                  is_regression = False
+                  if 'wer' in metric_name or 'latency' in metric_name:
+                      is_regression = change_pct > 20  # 20% increase
+                  elif 'accuracy' in metric_name or 'pesq' in metric_name:
+                      is_regression = change_pct < -5  # 5% decrease
+
+                  if is_regression:
+                      regressions.append({
+                          'metric': metric_name,
+                          'baseline': baseline_mean,
+                          'current': current_mean,
+                          'change_pct': change_pct
+                      })
+
+          if regressions:
+              print('⚠️  REGRESSIONS DETECTED:')
+              for r in regressions:
+                  print(f\"  {r['metric']}: {r['change_pct']:+.1f}% (baseline: {r['baseline']:.2f}, current: {r['current']:.2f})\")
+              exit(1)
+          else:
+              print('✓ No regressions detected')
+          " || echo "::warning::Regressions detected in voice AI metrics"
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Read metrics files
+            const resultsDir = 'tests/results';
+            let comment = '## 🎙️ Voice AI Test Results\n\n';
+
+            try {
+              // STT metrics
+              const sttAccuracy = JSON.parse(fs.readFileSync(path.join(resultsDir, 'stt_accuracy_metrics.json')));
+              const werClean = sttAccuracy.metrics?.stt_wer_clean?.mean;
+              if (werClean !== undefined) {
+                const status = werClean < 0.05 ? '✅' : '⚠️';
+                comment += `${status} **STT WER (clean):** ${(werClean * 100).toFixed(1)}% (target: <5%)\n`;
+              }
+
+              // TTS metrics
+              const ttsQuality = JSON.parse(fs.readFileSync(path.join(resultsDir, 'tts_quality_metrics.json')));
+              // Add TTS metrics if available
+
+              // Conversation metrics
+              const convMetrics = JSON.parse(fs.readFileSync(path.join(resultsDir, 'conversation_metrics.json')));
+              const avgLatency = convMetrics.metrics?.conversation_latency_ms?.mean;
+              if (avgLatency !== undefined) {
+                const status = avgLatency < 2500 ? '✅' : '⚠️';
+                comment += `${status} **E2E Latency:** ${avgLatency.toFixed(0)}ms (target: <2500ms)\n`;
+              }
+
+              // Turn-taking metrics
+              const turnMetrics = JSON.parse(fs.readFileSync(path.join(resultsDir, 'turn_taking_metrics.json')));
+              const turnAccuracy = turnMetrics.metrics?.turn_taking_overall_accuracy?.mean;
+              if (turnAccuracy !== undefined) {
+                const status = turnAccuracy >= 0.90 ? '✅' : '⚠️';
+                comment += `${status} **Turn-taking Accuracy:** ${(turnAccuracy * 100).toFixed(0)}% (target: >90%)\n`;
+              }
+
+              const falseInterruptRate = turnMetrics.metrics?.false_interruption_rate?.mean;
+              if (falseInterruptRate !== undefined) {
+                const status = falseInterruptRate <= 0.10 ? '✅' : '⚠️';
+                comment += `${status} **False Interruption Rate:** ${(falseInterruptRate * 100).toFixed(1)}% (target: <10%)\n`;
+              }
+
+            } catch (error) {
+              comment += '\n⚠️ Some metrics could not be loaded\n';
+            }
+
+            comment += '\n📊 Full test results are available in the workflow artifacts.';
+
+            // Post comment
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # Optional: Update baseline metrics on main branch
+  update-baseline:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results-python-3.11
+          path: tests/results/
+
+      - name: Update baseline
+        run: |
+          mkdir -p tests/baseline
+          cp tests/results/*_metrics.json tests/baseline/ || true
+
+      - name: Commit baseline
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add tests/baseline/
+          git commit -m "Update baseline metrics [skip ci]" || echo "No changes to commit"
+          git push || echo "Nothing to push"

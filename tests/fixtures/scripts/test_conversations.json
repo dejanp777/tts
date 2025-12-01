@@ -1,0 +1,113 @@
+{
+  "conversations": [
+    {
+      "name": "quick_question",
+      "description": "Simple question-answer exchange",
+      "turns": [
+        {
+          "user_text": "What's the weather today?",
+          "expect_keywords": ["weather"],
+          "audio_file": "clean_samples/weather_question.wav"
+        }
+      ]
+    },
+    {
+      "name": "multi_turn_context",
+      "description": "Multi-turn conversation with context preservation",
+      "turns": [
+        {
+          "user_text": "My name is Alice",
+          "expect_keywords": ["alice", "name"],
+          "audio_file": "clean_samples/name_alice.wav"
+        },
+        {
+          "user_text": "What's my name?",
+          "expect_keywords": ["alice"],
+          "audio_file": "clean_samples/whats_my_name.wav"
+        }
+      ]
+    },
+    {
+      "name": "thinking_pause",
+      "description": "User pauses mid-sentence to think",
+      "turns": [
+        {
+          "user_text": "I want to order a pizza",
+          "expect_keywords": ["pizza", "order"],
+          "audio_file": "clean_samples/thinking_pause_pizza.wav",
+          "note": "Audio contains 1.5s pause mid-sentence"
+        }
+      ]
+    },
+    {
+      "name": "polite_exchange",
+      "description": "Polite conversation with thank you",
+      "turns": [
+        {
+          "user_text": "Can you help me?",
+          "expect_keywords": ["help"],
+          "audio_file": "clean_samples/can_you_help.wav"
+        },
+        {
+          "user_text": "Thank you",
+          "expect_keywords": ["welcome", "problem"],
+          "audio_file": "clean_samples/thank_you.wav"
+        }
+      ]
+    },
+    {
+      "name": "complex_query",
+      "description": "Longer, more complex question",
+      "turns": [
+        {
+          "user_text": "Can you explain how photosynthesis works in plants?",
+          "expect_keywords": ["photosynthesis", "plant"],
+          "audio_file": "clean_samples/photosynthesis_question.wav"
+        }
+      ]
+    }
+  ],
+  "backchannel_samples": [
+    {
+      "text": "mm-hmm",
+      "audio_file": "backchannel_samples/mmhmm.wav",
+      "duration_ms": 400,
+      "should_not_interrupt": true
+    },
+    {
+      "text": "uh-huh",
+      "audio_file": "backchannel_samples/uhhuh.wav",
+      "duration_ms": 350,
+      "should_not_interrupt": true
+    },
+    {
+      "text": "yeah",
+      "audio_file": "backchannel_samples/yeah.wav",
+      "duration_ms": 300,
+      "should_not_interrupt": true
+    },
+    {
+      "text": "okay",
+      "audio_file": "backchannel_samples/okay.wav",
+      "duration_ms": 450,
+      "should_not_interrupt": true
+    }
+  ],
+  "interruption_samples": [
+    {
+      "text": "Wait, I have a question",
+      "audio_file": "clean_samples/wait_question.wav",
+      "should_interrupt": true
+    },
+    {
+      "text": "Hold on a second",
+      "audio_file": "clean_samples/hold_on.wav",
+      "should_interrupt": true
+    },
+    {
+      "text": "No, that's not what I meant",
+      "audio_file": "clean_samples/no_not_what_i_meant.wav",
+      "should_interrupt": true
+    }
+  ]
+}
