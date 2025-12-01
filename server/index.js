@@ -3,7 +3,14 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const axios = require('axios');
-const ffmpegPath = require('ffmpeg-static');
+// ffmpeg-static is optional - only needed for audio conversion
+let ffmpegPath;
+try {
+  ffmpegPath = require('ffmpeg-static');
+} catch (e) {
+  console.warn('[Warning] ffmpeg-static not available - audio conversion features disabled');
+  ffmpegPath = null;
+}
 const { spawn } = require('child_process');
 const FormData = require('form-data');
 
