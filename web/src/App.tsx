@@ -172,6 +172,7 @@ const App = () => {
   const silenceMsRef = useRef<number>(0)
   const segmentChunksRef = useRef<Blob[]>([])
   const pendingSegmentRef = useRef<{ blob: Blob; mime: string } | null>(null)
+  const turnPredictionCheckedRef = useRef<boolean>(false) // Track if we've checked prediction for current segment
   const headerChunkRef = useRef<Blob | null>(null)
   const pcmChunksRef = useRef<Float32Array[]>([])
   const sampleRateRef = useRef<number>(44100)
@@ -1389,7 +1390,107 @@ const App = () => {
         if (!collectingRef.current && voiceMsRef.current >= minVoiceMs) {
           collectingRef.current = true
           segmentChunksRef.current = []
+          turnPredictionCheckedRef.current = false // Reset prediction check for new segment
           setStatus('Recording...')
+        }
+
+        // Phase 2: Turn-Taking Prediction
+        // Check turn prediction after minimum silence but before maximum
+        const enableTurnPrediction = import.meta.env.VITE_ENABLE_TURN_PREDICTION === 'true' || false
+        const minSilenceMs = parseInt(import.meta.env.VITE_MIN_SILENCE_MS || '500')
+
+        if (enableTurnPrediction &&
+            collectingRef.current &&
+            !turnPredictionCheckedRef.current &&
+            silenceMsRef.current >= minSilenceMs &&
+            silenceMsRef.current < maxSilenceMs &&
+            pcmChunksRef.current.length > 0) {
+
+          // Mark that we've checked prediction for this segment
+          turnPredictionCheckedRef.current = true
+
+          // Extract audio features from collected audio
+          const merged = mergeFloat32([...pcmChunksRef.current])
+          const audioFeatures = extractAudioFeatures(
+            merged,
+            sampleRateRef.current,
+            voiceMsRef.current
+          )
+
+          // Call turn-prediction API
+          void (async () => {
+            try {
+              const response = await fetch(`${API_BASE}/api/turn-prediction`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  transcript: '', // No partial transcript available
+                  audioFeatures: {
+                    duration: audioFeatures.duration,
+                    intensity: audioFeatures.intensity,
+                    frequency: audioFeatures.frequency
+                  },
+                  silenceDuration: silenceMsRef.current,
+                  fallbackThreshold: maxSilenceMs
+                })
+              })
+
+              if (response.ok) {
+                const decision = await response.json()
+
+                console.log('[Turn Prediction]', {
+                  takeTurn: decision.takeTurn,
+                  confidence: decision.confidence,
+                  silenceDuration: silenceMsRef.current,
+                  threshold: decision.threshold
+                })
+
+                // If prediction says take turn with high confidence, process audio early
+                const fusionThreshold = parseFloat(import.meta.env.VITE_FUSION_THRESHOLD || '0.7')
+                if (decision.takeTurn && decision.confidence >= fusionThreshold && collectingRef.current) {
+                  console.log('[Turn Prediction] Taking turn early based on prediction')
+
+                  // Process the audio immediately
+                  const segChunks = [...segmentChunksRef.current]
+                  const pcmChunks = [...pcmChunksRef.current]
+                  segmentChunksRef.current = []
+                  pcmChunksRef.current = []
+                  collectingRef.current = false
+                  voiceMsRef.current = 0
+                  silenceMsRef.current = 0
+
+                  let approxMs = 0
+                  if (pcmChunks.length > 0) {
+                    const totalSamples = pcmChunks.reduce((s, c) => s + c.length, 0)
+                    approxMs = (totalSamples / sampleRateRef.current) * 1000
+                  } else {
+                    approxMs = segChunks.length * 250
+                  }
+
+                  if (approxMs >= 900) {
+                    let blob: Blob
+                    if (pcmChunks.length > 0) {
+                      const merged = mergeFloat32(pcmChunks)
+                      const down = downsample(merged, sampleRateRef.current, 16000)
+                      blob = encodeWavPCM16(down, 16000)
+                    } else {
+                      const parts = headerChunkRef.current ? [headerChunkRef.current, ...segChunks] : segChunks
+                      blob = new Blob(parts, { type: mimeType })
+                    }
+                    if (isProcessing) {
+                      pendingSegmentRef.current = { blob, mime: mimeType }
+                      setStatus('Queued next segment...')
+                    } else {
+                      void handleRecordedAudio(blob, mimeType)
+                    }
+                  }
+                }
+              }
+            } catch (err) {
+              // Silently fail - will fall back to regular silence detection
+              console.warn('[Turn Prediction] API call failed, falling back to silence detection:', err)
+            }
+          })()
         }
 
         if (collectingRef.current && silenceMsRef.current >= maxSilenceMs) {
