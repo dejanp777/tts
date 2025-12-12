@@ -1,0 +1,98 @@
+.anticipation-notification {
+    position: fixed;
+    bottom: 100px;
+    right: 20px;
+    max-width: 350px;
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+    padding: 16px;
+    animation: slideInRight 0.3s ease-out;
+    z-index: 1000;
+}
+
+@keyframes slideInRight {
+    from {
+        transform: translateX(400px);
+        opacity: 0;
+    }
+
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+.anticipation-content {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.anticipation-icon {
+    font-size: 24px;
+    flex-shrink: 0;
+}
+
+.anticipation-message {
+    flex: 1;
+}
+
+.anticipation-type {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #666;
+    margin-bottom: 4px;
+    font-weight: 600;
+}
+
+.anticipation-text {
+    font-size: 14px;
+    color: #333;
+    line-height: 1.4;
+}
+
+.anticipation-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.anticipation-btn {
+    padding: 6px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.anticipation-btn-accept {
+    background: #4CAF50;
+    color: white;
+}
+
+.anticipation-btn-accept:hover {
+    background: #45a049;
+    transform: translateY(-1px);
+}
+
+.anticipation-btn-dismiss {
+    background: #f0f0f0;
+    color: #666;
+}
+
+.anticipation-btn-dismiss:hover {
+    background: #e0e0e0;
+}
+
+@media (max-width: 768px) {
+    .anticipation-notification {
+        right: 10px;
+        left: 10px;
+        max-width: none;
+    }
+}

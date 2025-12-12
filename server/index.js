@@ -13,6 +13,11 @@ try {
 }
 const { spawn } = require('child_process');
 const FormData = require('form-data');
+const ResponseCache = require('./utils/responseCache');
+
+// Initialize response cache
+const responseCache = new ResponseCache();
+responseCache.preCacheCommonResponses();
 
 const PORT = process.env.PORT || 4000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
@@ -297,6 +302,18 @@ app.post('/api/chat', async (req, res) => {
       ...messages,
     ];
 
+    // Check cache first
+    const cacheKey = responseCache.generateKey(fullMessages);
+    const cachedResponse = responseCache.get(cacheKey);
+
+    if (cachedResponse) {
+      // Return cached response
+      return res.json({
+        message: { role: 'assistant', content: cachedResponse },
+        cached: true
+      });
+    }
+
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
@@ -317,9 +334,18 @@ app.post('/api/chat', async (req, res) => {
     );
 
     const choice = response.data?.choices?.[0];
+    const assistantMessage = choice?.message?.content;
+
+    // Cache the response if it's a simple query (short user message)
+    const lastUserMessage = messages[messages.length - 1];
+    if (lastUserMessage && lastUserMessage.content.length < 50) {
+      responseCache.set(cacheKey, assistantMessage);
+    }
+
     res.json({
       message: choice?.message,
       raw: response.data,
+      cached: false
     });
   } catch (error) {
     console.error('[chat] error', error.response?.data || error.message);
@@ -695,6 +721,46 @@ app.post('/api/turn-prediction', async (req, res) => {
   }
 });
 
+// Feedback endpoint
+app.post('/api/feedback', (req, res) => {
+  const { messageId, isPositive, timestamp, context } = req.body || {};
+
+  if (!messageId || isPositive === undefined) {
+    return res.status(400).json({ error: 'messageId and isPositive are required' });
+  }
+
+  const feedback = {
+    messageId,
+    isPositive,
+    timestamp: timestamp || Date.now(),
+    context: context || {}
+  };
+
+  // Log feedback (in production, save to database)
+  console.log('[Feedback]', feedback);
+
+  // For now, just acknowledge receipt
+  // In production, you would save to a database or file
+  res.json({ success: true, message: 'Feedback received' });
+});
+
+// Cache statistics endpoint
+app.get('/api/cache/stats', (req, res) => {
+  res.json(responseCache.getStats());
+});
+
+// Clear cache endpoint (for development/testing)
+app.post('/api/cache/clear', (req, res) => {
+  responseCache.clear();
+  res.json({ message: 'Cache cleared successfully' });
+});
+
+// Periodic cleanup of expired cache entries (every 5 minutes)
+setInterval(() => {
+  responseCache.clearExpired();
+}, 5 * 60 * 1000);
+
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
+  console.log('[Cache] Response caching enabled');
 });

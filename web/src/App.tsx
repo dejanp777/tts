@@ -2,9 +2,32 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import './App.css'
 import { SettingsPanel } from './components/SettingsPanel'
+import { FeedbackButton } from './components/FeedbackButton'
+import { AnticipationNotification } from './components/AnticipationNotification'
+import { ConfirmationDialog } from './components/ConfirmationDialog'
+import { UndoButton } from './components/UndoButton'
 import { classifyUserAudio as classifyBackchannel, extractAudioFeatures } from './utils/backchannels'
 import { ThinkingFillerManager } from './utils/thinkingFillers'
 import { detectMessageType, selectProsody, type ProsodyProfile } from './utils/prosody'
+import { TwoPassEndpointer } from './utils/twoPassEndpointing'
+import { ContextAwareThreshold } from './utils/contextAwareThreshold'
+import { AdaptiveLearningSystem } from './utils/adaptiveLearning'
+// Note: classifyInterruption and detectResumeIntent available for future use
+// import { classifyInterruption, detectResumeIntent } from './utils/interruptionClassifier'
+// Reserved for future verbosity adaptation:
+// import { VerbosityController } from './utils/verbosityController'
+import { MemoryManager } from './utils/conversationMemory'
+import { AnticipationEngine, type Anticipation } from './utils/anticipation'
+import { ReflectionEngine, type CriticalInfo } from './utils/reflection'
+import { UndoManager } from './utils/undo'
+import { ErrorRecovery, type ErrorContext } from './utils/errorRecovery'
+import { FeedbackTiming } from './utils/feedbackTiming'
+import { SpeculativeGenerator, type ConversationContext } from './utils/speculativeGeneration'
+import { ChunkedDelivery } from './utils/chunkedDelivery'
+import { ConversationalSteering, type ConversationalCue } from './utils/conversationalSteering'
+import { FlowAdaptation } from './utils/flowAdaptation'
+import { SteeringCue } from './components/SteeringCue'
+import { ABTestingFramework, EXPERIMENTS } from './utils/abTesting'
 
 type ChatMessage = {
   id: string
@@ -20,6 +43,8 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') || ''
 
 // Feature flags
 const ENABLE_TTS_STREAM = import.meta.env.VITE_ENABLE_TTS_STREAM === 'true' || false
+const ENABLE_SPECULATIVE_GEN = import.meta.env.VITE_ENABLE_SPECULATIVE_GEN === 'true' || false
+const ENABLE_CHUNKED_DELIVERY = import.meta.env.VITE_ENABLE_CHUNKED_DELIVERY === 'true' || false
 
 const MEDIA_MIME_TYPES = [
   'audio/webm;codecs=opus',
@@ -31,9 +56,9 @@ const MEDIA_MIME_TYPES = [
 const AUTOPLAY_STATUS = 'Playing voice...'
 
 const createId = () =>
-  (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2, 11))
+(typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+  ? crypto.randomUUID()
+  : Math.random().toString(36).slice(2, 11))
 
 // Helper function to decode base64 to Float32Array
 function base64ToFloat32Array(base64: string): Float32Array {
@@ -180,6 +205,7 @@ const App = () => {
   const chatAbortControllerRef = useRef<AbortController | null>(null)
   const ttsAbortControllerRef = useRef<AbortController | null>(null)
   const isProcessingRef = useRef<boolean>(false) // Ref to avoid dependency issues
+  const fillerPlaybackRef = useRef<Promise<void> | null>(null) // Track filler playback for TTS coordination
 
   function mergeFloat32(chunks: Float32Array[]) {
     const total = chunks.reduce((sum, c) => sum + c.length, 0)
@@ -272,7 +298,7 @@ const App = () => {
     try {
       analyserRef.current?.disconnect()
       audioContextRef.current?.close()
-    } catch {}
+    } catch { }
     analyserRef.current = null
     audioContextRef.current = null
     collectingRef.current = false
@@ -361,7 +387,7 @@ const App = () => {
               }
             }
 
-            recorder.onstop = () => {}
+            recorder.onstop = () => { }
             recorder.start(250)
             setIsRecording(true)
             setStatus('Listening...')
@@ -407,7 +433,7 @@ const App = () => {
                 }
               }
 
-              recorder.onstop = () => {}
+              recorder.onstop = () => { }
               recorder.start(250)
               setIsRecording(true)
               setStatus('Listening...')
@@ -488,7 +514,7 @@ const App = () => {
     return () => navigator.mediaDevices?.removeEventListener?.('devicechange', handler)
   }, [refreshDevices])
 
-  const requestChatCompletion = useCallback(async (history: ChatMessage[]) => {
+  const requestChatCompletion = useCallback(async (history: ChatMessage[], memoryContext?: string) => {
     const payload = history.map((entry) => ({
       role: entry.role,
       content: entry.text,
@@ -504,7 +530,10 @@ const App = () => {
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: payload }),
+      body: JSON.stringify({
+        messages: payload,
+        memoryContext: memoryContext || undefined
+      }),
       signal: controller.signal,
     })
 
@@ -525,10 +554,10 @@ const App = () => {
 
     const content = Array.isArray(assistantMessage.content)
       ? assistantMessage.content
-          .map((segment: { text?: string } | string) =>
-            typeof segment === 'string' ? segment : segment?.text ?? ''
-          )
-          .join('')
+        .map((segment: { text?: string } | string) =>
+          typeof segment === 'string' ? segment : segment?.text ?? ''
+        )
+        .join('')
       : assistantMessage.content ?? ''
 
     if (!content.trim()) {
@@ -685,6 +714,84 @@ const App = () => {
     })
   )
 
+  // Phase 3: Advanced Endpointing and Adaptive Learning
+  const twoPassEndpointerRef = useRef<TwoPassEndpointer>(
+    new TwoPassEndpointer(userSilenceThreshold)
+  )
+  const contextAwareThresholdRef = useRef<ContextAwareThreshold>(
+    new ContextAwareThreshold(userSilenceThreshold)
+  )
+  const adaptiveLearningRef = useRef<AdaptiveLearningSystem>(
+    new AdaptiveLearningSystem('default', userSilenceThreshold)
+  )
+
+  // Track conversation context for adaptive systems
+  // Reserved for future use in adaptive systems:
+  // const conversationStartTimeRef = useRef<number>(Date.now())
+  const lastTranscriptRef = useRef<string>('')
+  const lastTranscriptTimeRef = useRef<number>(0)
+
+  // Interruption Classification and Verbosity Control
+  // Reserved for future use in verbosity adaptation:
+  // const verbosityControllerRef = useRef<VerbosityController>(new VerbosityController())
+  // const [isPaused, setIsPaused] = useState(false) // Track if AI is paused
+  // const pausedStateRef = useRef<{
+  //   messageId: string | null
+  //   position: number
+  // }>({ messageId: null, position: 0 })
+
+  // Phase 1: UX Principles - RECALL, ANTICIPATE, REFLECT, Undo
+  const memoryManagerRef = useRef<MemoryManager>(new MemoryManager())
+  const anticipationEngineRef = useRef<AnticipationEngine>(new AnticipationEngine())
+  const reflectionEngineRef = useRef<ReflectionEngine>(new ReflectionEngine())
+  const undoManagerRef = useRef<UndoManager>(new UndoManager())
+
+  const [currentAnticipation, setCurrentAnticipation] = useState<Anticipation | null>(null)
+  const [pendingConfirmation, setPendingConfirmation] = useState<CriticalInfo | null>(null)
+  const [showUndoButton, setShowUndoButton] = useState(false)
+  const undoTimerRef = useRef<number | null>(null)
+
+  // Error Recovery and Feedback Systems
+  const errorRecoveryRef = useRef<ErrorRecovery>(new ErrorRecovery())
+  const feedbackTimingRef = useRef<FeedbackTiming>(new FeedbackTiming())
+  const [feedbackMessageIds, setFeedbackMessageIds] = useState<Set<string>>(new Set())
+
+  // Speculative Generation System
+  const speculativeGeneratorRef = useRef<SpeculativeGenerator>(new SpeculativeGenerator())
+
+  // Chunked Delivery System
+  const chunkedDeliveryRef = useRef<ChunkedDelivery>(
+    new ChunkedDelivery({
+      maxChunkLength: 150,
+      minChunkLength: 30,
+      basePauseMs: 500,
+      enableChunking: ENABLE_CHUNKED_DELIVERY
+    })
+  )
+
+  // PULL: Conversational Steering System
+  const conversationalSteeringRef = useRef<ConversationalSteering>(new ConversationalSteering())
+  const [currentSteeringCue, setCurrentSteeringCue] = useState<ConversationalCue | null>(null)
+
+  // ADAPT: Flow Adaptation System
+  const flowAdaptationRef = useRef<FlowAdaptation>(new FlowAdaptation())
+
+  // A/B Testing Framework
+  const abTestingRef = useRef<ABTestingFramework | null>(null)
+
+  // Initialize A/B testing on mount
+  useEffect(() => {
+    if (!abTestingRef.current) {
+      const framework = new ABTestingFramework()
+      // Register pre-defined experiments
+      framework.registerExperiment(EXPERIMENTS.SILENCE_THRESHOLD)
+      framework.registerExperiment(EXPERIMENTS.TTS_STREAMING)
+      framework.registerExperiment(EXPERIMENTS.THINKING_FILLERS)
+      abTestingRef.current = framework
+      console.log('[A/B Testing] Active experiments:', framework.getActiveExperiments().map(e => e.name))
+    }
+  }, [])
+
   // Update filler manager when user preference changes
   useEffect(() => {
     fillerManagerRef.current = new ThinkingFillerManager({
@@ -840,6 +947,29 @@ const App = () => {
         status: 'complete' as const,
       }
 
+      // Phase 1: RECALL - Extract memories from user message
+      memoryManagerRef.current.extractMemories(trimmed, userMessage.id)
+
+      // Phase 1: ANTICIPATE - Check for anticipation opportunities
+      const previousMessages = messagesRef.current
+        .filter(m => m.role === 'user')
+        .map(m => m.text)
+      const anticipation = anticipationEngineRef.current.anticipate(trimmed, previousMessages)
+      if (anticipation && anticipation.confidence > 0.7) {
+        console.log('[Anticipation] Detected:', anticipation)
+        setCurrentAnticipation(anticipation)
+      }
+
+      // Phase 1: REFLECT - Check for critical information
+      const criticalInfo = reflectionEngineRef.current.detectCriticalInfo(trimmed)
+      if (criticalInfo && criticalInfo.confidence > 0.8) {
+        console.log('[Reflection] Critical info detected:', criticalInfo)
+        setPendingConfirmation(criticalInfo)
+        // Don't proceed with message flow - wait for confirmation
+        setIsProcessing(false)
+        return
+      }
+
       const conversationWithUser: ChatMessage[] = [...messagesRef.current, userMessage]
       messagesRef.current = conversationWithUser
       setMessages(conversationWithUser)
@@ -855,9 +985,14 @@ const App = () => {
         fillerTimeout = window.setTimeout(async () => {
           try {
             console.log('[Filler] Playing thinking filler:', fillerUrl)
-            await fillerManagerRef.current.playFiller(fillerUrl)
+            // Store the playback promise so TTS can wait for or stop it
+            const playbackPromise = fillerManagerRef.current.playFiller(fillerUrl)
+            fillerPlaybackRef.current = playbackPromise
+            await playbackPromise
           } catch (err) {
             console.error('[Filler] Failed to play:', err)
+          } finally {
+            fillerPlaybackRef.current = null
           }
         }, fillerManagerRef.current['options'].thresholdMs)
       }
@@ -907,7 +1042,13 @@ const App = () => {
           setMessages([...conversationWithUser, assistantMessage])
         } else {
           // Use non-streaming chat
-          assistantText = await requestChatCompletion(conversationWithUser)
+          // Phase 1: RECALL - Get memory context for injection
+          const memoryContext = memoryManagerRef.current.formatForPrompt()
+          if (memoryContext) {
+            console.log('[Memory] Injecting context:', memoryContext)
+          }
+
+          assistantText = await requestChatCompletion(conversationWithUser, memoryContext)
           const assistantMessage: ChatMessage = {
             id: assistantId,
             role: 'assistant',
@@ -921,11 +1062,35 @@ const App = () => {
           ]
           messagesRef.current = conversationWithAssistant
           setMessages(conversationWithAssistant)
+
+          // Phase 1: Undo - Save state after message pair
+          undoManagerRef.current.saveState(conversationWithAssistant)
         }
 
         // Clear filler timeout once we have response
         if (fillerTimeout) {
           window.clearTimeout(fillerTimeout)
+        }
+
+        // Coordinate with any playing filler before starting TTS
+        if (fillerPlaybackRef.current) {
+          const playbackDuration = fillerManagerRef.current.getPlaybackDuration()
+          const MAX_WAIT_DURATION = 800 // Don't wait more than 800ms for filler
+
+          if (playbackDuration > MAX_WAIT_DURATION) {
+            // Filler has been playing too long, stop it to minimize TTS delay
+            console.log('[Filler] Stopping long-playing filler after', playbackDuration, 'ms')
+            fillerManagerRef.current.stopFiller()
+          } else if (fillerManagerRef.current.isPlaying()) {
+            // Short filler - wait for natural completion
+            console.log('[Filler] Waiting for short filler to finish, elapsed:', playbackDuration, 'ms')
+            try {
+              await fillerPlaybackRef.current
+            } catch (err) {
+              console.log('[Filler] Filler ended with error:', err)
+            }
+          }
+          fillerPlaybackRef.current = null
         }
 
         setStatus('Generating voice...')
@@ -1006,15 +1171,127 @@ const App = () => {
           const prosody = selectProsody(messageType, assistantText)
           console.log('[Prosody] Selected:', { messageType, prosody })
 
-          const audioUrl = await synthesizeSpeech(assistantText, prosody)
+          // Check if response should be chunked
+          if (ENABLE_CHUNKED_DELIVERY && chunkedDeliveryRef.current.shouldChunk(assistantText)) {
+            console.log('[Chunked Delivery] Chunking response')
+            const chunks = chunkedDeliveryRef.current.chunkResponse(assistantText)
 
-          const finalizedMessages = messagesRef.current.map((entry) =>
-            entry.id === assistantId ? { ...entry, audioUrl, status: 'complete' as const } : entry
-          )
+            // Generate TTS for all chunks in advance
+            const chunkAudioUrls: string[] = []
+            for (const chunk of chunks) {
+              const chunkProsody = selectProsody(detectMessageType(chunk.text), chunk.text)
+              const audioUrl = await synthesizeSpeech(chunk.text, chunkProsody)
+              chunkAudioUrls.push(audioUrl)
+            }
 
-          messagesRef.current = finalizedMessages
-          setMessages(finalizedMessages)
+            // Play chunks sequentially with pauses
+            for (let i = 0; i < chunks.length; i++) {
+              const chunk = chunks[i]
+              const audioUrl = chunkAudioUrls[i]
+
+              console.log(`[Chunked Delivery] Playing chunk ${i + 1}/${chunks.length}`)
+
+              // Play this chunk
+              const audio = new Audio(audioUrl)
+              audio.volume = 1.0
+              currentAudioRef.current = audio
+
+              setIsPlaying(true)
+              setPlayingMessageId(assistantId)
+
+              // Wait for chunk to finish playing
+              await new Promise<void>((resolve, reject) => {
+                audio.onended = () => {
+                  setIsPlaying(false)
+                  setPlayingMessageId(null)
+                  currentAudioRef.current = null
+                  resolve()
+                }
+                audio.onerror = () => {
+                  reject(new Error('Audio playback failed'))
+                }
+                audio.play().catch(reject)
+              })
+
+              // Add pause after chunk (unless it's the last one)
+              if (!chunk.isLast && chunk.pauseAfterMs > 0) {
+                console.log(`[Chunked Delivery] Pausing for ${chunk.pauseAfterMs}ms`)
+                await new Promise(resolve => setTimeout(resolve, chunk.pauseAfterMs))
+              }
+            }
+
+            // Mark as complete
+            const finalizedMessages = messagesRef.current.map((entry) =>
+              entry.id === assistantId ? { ...entry, status: 'complete' as const } : entry
+            )
+
+            messagesRef.current = finalizedMessages
+            setMessages(finalizedMessages)
+          } else {
+            // Regular non-chunked TTS
+            const audioUrl = await synthesizeSpeech(assistantText, prosody)
+
+            const finalizedMessages = messagesRef.current.map((entry) =>
+              entry.id === assistantId ? { ...entry, audioUrl, status: 'complete' as const } : entry
+            )
+
+            messagesRef.current = finalizedMessages
+            setMessages(finalizedMessages)
+          }
+
           setStatus(null)
+
+          // Phase 1: Undo - Show undo button for 30 seconds
+          setShowUndoButton(true)
+          if (undoTimerRef.current) {
+            window.clearTimeout(undoTimerRef.current)
+          }
+          undoTimerRef.current = window.setTimeout(() => {
+            setShowUndoButton(false)
+          }, 30000) // 30 seconds
+        }
+
+        // Start speculative generation if enabled
+        if (ENABLE_SPECULATIVE_GEN) {
+          const context: ConversationContext = {
+            recentMessages: messagesRef.current.map(m => ({ role: m.role, text: m.text })),
+            currentTopic: undefined // Could be enhanced with topic tracking
+          }
+
+          const prediction = speculativeGeneratorRef.current.predictUserInput(context)
+          if (prediction) {
+            console.log('[Speculative] Starting speculation based on prediction:', prediction)
+            void speculativeGeneratorRef.current.startSpeculation(
+              prediction.text,
+              prediction.confidence,
+              async (text, _signal) => {
+                // Use the existing request function with the speculative text
+                const speculativeHistory = [
+                  ...messagesRef.current,
+                  { id: createId(), role: 'user' as const, text, status: 'complete' as const }
+                ]
+                return await requestChatCompletion(speculativeHistory)
+              }
+            )
+          }
+        }
+
+        // ADAPT: Flow adaptation based on user style
+        const previousUserMessages = messagesRef.current
+          .filter(m => m.role === 'user')
+          .map(m => m.text)
+        const flowAdaptation = flowAdaptationRef.current.adapt(trimmed, previousUserMessages)
+        console.log('[ADAPT] Flow adaptation:', {
+          style: flowAdaptation.styleAdjustments,
+          topicHandling: flowAdaptation.topicHandling,
+          suggestedTone: flowAdaptation.suggestedTone
+        })
+
+        // PULL: Generate conversational steering cues
+        const steeringCue = conversationalSteeringRef.current.generateCue(assistantText, trimmed)
+        if (steeringCue) {
+          console.log('[PULL] Steering cue generated:', steeringCue)
+          setCurrentSteeringCue(steeringCue)
         }
       } catch (err) {
         console.error(err)
@@ -1023,6 +1300,12 @@ const App = () => {
         if (fillerTimeout) {
           window.clearTimeout(fillerTimeout)
         }
+
+        // Stop any playing filler
+        if (fillerManagerRef.current.isPlaying()) {
+          fillerManagerRef.current.stopFiller()
+        }
+        fillerPlaybackRef.current = null
 
         // Handle AbortError gracefully (from barge-in)
         if (err instanceof Error && err.name === 'AbortError') {
@@ -1108,9 +1391,108 @@ const App = () => {
         const t1 = performance.now()
         console.log(`⏱️ [TIMING] STT took ${(t1 - t0).toFixed(0)}ms`)
 
-        await sendMessageFlow(transcript)
+        // Phase 3: Adaptive Learning - Provide feedback based on user interaction
+        if (transcript && transcript.trim()) {
+          const currentTime = Date.now()
+          const timeSinceLastTranscript = lastTranscriptTimeRef.current
+            ? currentTime - lastTranscriptTimeRef.current
+            : 0
+
+          // Detect interruption pattern (user re-prompted quickly)
+          if (lastTranscriptRef.current && timeSinceLastTranscript < 2000) {
+            const isInterruption = adaptiveLearningRef.current.detectInterruption(
+              lastTranscriptRef.current,
+              transcript,
+              timeSinceLastTranscript
+            )
+
+            if (isInterruption) {
+              adaptiveLearningRef.current.updateFromFeedback({
+                type: 'interruption',
+                timestamp: currentTime,
+                context: {
+                  threshold: userSilenceThreshold,
+                  silenceDuration: timeSinceLastTranscript,
+                  transcriptLength: transcript.length
+                }
+              })
+            }
+          }
+
+          // Update last transcript for next comparison
+          lastTranscriptRef.current = transcript
+          lastTranscriptTimeRef.current = currentTime
+        }
+
+        // Try to use speculative response if enabled
+        let usedSpeculativeResponse = false
+        if (ENABLE_SPECULATIVE_GEN) {
+          const speculativeResponse = await speculativeGeneratorRef.current.tryUseSpeculation(transcript)
+          if (speculativeResponse) {
+            console.log('[Speculative] Using speculative response! Latency saved.')
+            usedSpeculativeResponse = true
+
+            // Use the speculative response directly
+            const userMessage: ChatMessage = {
+              id: createId(),
+              role: 'user',
+              text: transcript,
+              status: 'complete' as const,
+            }
+            const assistantMessage: ChatMessage = {
+              id: createId(),
+              role: 'assistant',
+              text: speculativeResponse,
+              status: 'complete' as const,
+            }
+            const updatedMessages = [...messagesRef.current, userMessage, assistantMessage]
+            messagesRef.current = updatedMessages
+            setMessages(updatedMessages)
+
+            // Still need to generate TTS
+            setStatus('Generating voice...')
+            const messageType = detectMessageType(speculativeResponse)
+            const prosody = selectProsody(messageType, speculativeResponse)
+            const audioUrl = await synthesizeSpeech(speculativeResponse, prosody)
+
+            const finalMessages = messagesRef.current.map((entry) =>
+              entry.id === assistantMessage.id ? { ...entry, audioUrl } : entry
+            )
+            messagesRef.current = finalMessages
+            setMessages(finalMessages)
+            setStatus(null)
+          }
+        }
+
+        // If no speculative response was used, do normal flow
+        if (!usedSpeculativeResponse) {
+          await sendMessageFlow(transcript)
+        }
+
         const t2 = performance.now()
         console.log(`⏱️ [TIMING] Total flow (STT + Chat + TTS) took ${(t2 - t0).toFixed(0)}ms`)
+
+        // Reset error recovery on successful interaction
+        errorRecoveryRef.current.resetErrors()
+
+        // Track A/B test conversions for successful turn
+        if (abTestingRef.current) {
+          abTestingRef.current.trackConversion('silence_threshold_v1')
+          abTestingRef.current.trackCustomMetric('silence_threshold_v1', 'successful_turns', 1)
+        }
+
+        // Check if we should show feedback button
+        const turnNumber = messagesRef.current.filter(m => m.role === 'user').length
+        if (feedbackTimingRef.current.shouldAskFeedback(turnNumber)) {
+          // Get the last assistant message
+          const lastAssistantMessage = messagesRef.current
+            .filter(m => m.role === 'assistant')
+            .pop()
+          if (lastAssistantMessage) {
+            setFeedbackMessageIds(prev => new Set(prev).add(lastAssistantMessage.id))
+            feedbackTimingRef.current.recordFeedbackAsked(turnNumber)
+          }
+        }
 
         // Reset processing flag after successful completion
         isProcessingRef.current = false
@@ -1119,13 +1501,43 @@ const App = () => {
         console.error(err)
         const message =
           err instanceof Error ? err.message : 'Failed to transcribe audio. Please try again.'
+
+        // Integrate error recovery
+        const errorContext: ErrorContext = {
+          transcript: '',
+          duration: voiceMsRef.current,
+          consecutiveErrors: errorRecoveryRef.current.getStats().consecutiveErrors
+        }
+
         if (typeof message === 'string' && message.toLowerCase().includes('empty result')) {
-          // Skip showing an error for silent/empty segments
-          setStatus('No speech detected; waiting...')
+          // Classify as NO_MATCH error
+          const errorType = errorRecoveryRef.current.classifyError(errorContext)
+          const recoveryAction = errorRecoveryRef.current.getRecoveryAction(errorType)
+
+          console.log('[Error Recovery]', {
+            errorType: recoveryAction.errorType,
+            message: recoveryAction.message,
+            offerTyping: recoveryAction.offerTyping
+          })
+
+          // Show recovery message
+          setStatus(recoveryAction.message)
+
+          // If offering typing, keep the error displayed
+          if (recoveryAction.offerTyping) {
+            setError("Having trouble with voice? Try typing your message instead.")
+          }
         } else {
+          // Other errors
           setError(message)
           setStatus(null)
         }
+
+        // Track A/B test errors
+        if (abTestingRef.current) {
+          abTestingRef.current.trackError('silence_threshold_v1')
+        }
+
         isProcessingRef.current = false
         setIsProcessing(false)
       }
@@ -1149,20 +1561,20 @@ const App = () => {
 
       const constraints: MediaStreamConstraints = selectedMicId
         ? {
-            audio: {
-              deviceId: { exact: selectedMicId },
-              echoCancellation: enableFullDuplex,
-              noiseSuppression: enableFullDuplex,
-              autoGainControl: enableFullDuplex
-            }
+          audio: {
+            deviceId: { exact: selectedMicId },
+            echoCancellation: enableFullDuplex,
+            noiseSuppression: enableFullDuplex,
+            autoGainControl: enableFullDuplex
           }
+        }
         : {
-            audio: {
-              echoCancellation: enableFullDuplex,
-              noiseSuppression: enableFullDuplex,
-              autoGainControl: enableFullDuplex
-            }
+          audio: {
+            echoCancellation: enableFullDuplex,
+            noiseSuppression: enableFullDuplex,
+            autoGainControl: enableFullDuplex
           }
+        }
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
       const recorder = new MediaRecorder(stream, { mimeType })
       mediaRecorderRef.current = recorder
@@ -1190,7 +1602,7 @@ const App = () => {
         resetRecorder()
       }
 
-      recorder.onstop = () => {}
+      recorder.onstop = () => { }
 
       recorder.start(250) // emit small chunks
       setIsRecording(true)
@@ -1345,8 +1757,8 @@ const App = () => {
 
           // Only trigger barge-in for real interruptions, not backchannels
           if (backchannelClassification.type === 'INTERRUPTION' &&
-              backchannelClassification.confidence > 0.7 &&
-              voiceMsRef.current >= bargeInThresholdMs) {
+            backchannelClassification.confidence > 0.7 &&
+            voiceMsRef.current >= bargeInThresholdMs) {
 
             console.log('[Barge-in] User interrupted AI (not a backchannel)')
 
@@ -1400,11 +1812,11 @@ const App = () => {
         const minSilenceMs = parseInt(import.meta.env.VITE_MIN_SILENCE_MS || '500')
 
         if (enableTurnPrediction &&
-            collectingRef.current &&
-            !turnPredictionCheckedRef.current &&
-            silenceMsRef.current >= minSilenceMs &&
-            silenceMsRef.current < maxSilenceMs &&
-            pcmChunksRef.current.length > 0) {
+          collectingRef.current &&
+          !turnPredictionCheckedRef.current &&
+          silenceMsRef.current >= minSilenceMs &&
+          silenceMsRef.current < maxSilenceMs &&
+          pcmChunksRef.current.length > 0) {
 
           // Mark that we've checked prediction for this segment
           turnPredictionCheckedRef.current = true
@@ -1493,40 +1905,100 @@ const App = () => {
           })()
         }
 
-        if (collectingRef.current && silenceMsRef.current >= maxSilenceMs) {
-          const segChunks = [...segmentChunksRef.current]
-          const pcmChunks = [...pcmChunksRef.current]
-          segmentChunksRef.current = []
-          pcmChunksRef.current = []
-          collectingRef.current = false
-          voiceMsRef.current = 0
-          silenceMsRef.current = 0
-          let approxMs = 0
-          if (pcmChunks.length > 0) {
-            const totalSamples = pcmChunks.reduce((s, c) => s + c.length, 0)
-            approxMs = (totalSamples / sampleRateRef.current) * 1000
-          } else {
-            approxMs = segChunks.length * 250
-          }
-          if (approxMs >= 900) {
-            // Prefer WAV PCM encoded from raw samples if available, else fallback to container chunks
-            let blob: Blob
+        // Phase 3: Intelligent Endpointing with Two-Pass Validation
+        if (collectingRef.current && silenceMsRef.current >= minSilenceMs) {
+          // Get current partial transcript if available (we don't have it in this implementation)
+          // For now, we'll use empty string and rely on acoustic features
+          const partialTranscript = ''
+
+          // Calculate context-aware threshold
+          const turnNumber = messages.filter(m => m.role === 'user').length + 1
+          const contextThreshold = contextAwareThresholdRef.current.calculateThreshold({
+            turnNumber,
+            transcriptLength: partialTranscript.length,
+            userHistory: {
+              interruptionRate: adaptiveLearningRef.current.getProfile().stats.interruptionRate,
+              averageTurnLength: adaptiveLearningRef.current.getProfile().stats.averageTurnLength
+            }
+          })
+
+          // Use adaptive learning threshold if available, otherwise use context-aware threshold
+          const adaptiveThreshold = adaptiveLearningRef.current.getOptimalThreshold()
+          const effectiveThreshold = Math.max(contextThreshold, adaptiveThreshold)
+
+          // Update two-pass endpointer with current threshold
+          twoPassEndpointerRef.current.updateThreshold(effectiveThreshold)
+
+          // Check if we've reached the effective threshold
+          if (silenceMsRef.current >= effectiveThreshold) {
+            // Perform two-pass endpointing validation
+            const endpointDecision = twoPassEndpointerRef.current.process(
+              silenceMsRef.current,
+              partialTranscript
+            )
+
+            console.log('[Phase 3 Endpointing]', {
+              silenceDuration: silenceMsRef.current,
+              contextThreshold,
+              adaptiveThreshold,
+              effectiveThreshold,
+              endpoint: endpointDecision.endpoint,
+              confidence: endpointDecision.confidence,
+              reason: endpointDecision.reason
+            })
+
+            // If endpoint decision says to extend threshold, wait longer
+            if (!endpointDecision.endpoint && endpointDecision.extendThreshold) {
+              // Don't process yet, wait for extended threshold
+              const extendedThreshold = endpointDecision.extendThreshold
+              if (silenceMsRef.current < extendedThreshold) {
+                // Continue waiting
+                return
+              }
+            }
+
+            // Process the audio segment
+            const segChunks = [...segmentChunksRef.current]
+            const pcmChunks = [...pcmChunksRef.current]
+            segmentChunksRef.current = []
+            pcmChunksRef.current = []
+            collectingRef.current = false
+            voiceMsRef.current = 0
+            // Note: silenceMsRef.current contains final silence duration if needed for future metrics
+            silenceMsRef.current = 0
+
+            let approxMs = 0
             if (pcmChunks.length > 0) {
-              const merged = mergeFloat32(pcmChunks)
-              const down = downsample(merged, sampleRateRef.current, 16000)
-              blob = encodeWavPCM16(down, 16000)
+              const totalSamples = pcmChunks.reduce((s, c) => s + c.length, 0)
+              approxMs = (totalSamples / sampleRateRef.current) * 1000
             } else {
-              const parts = headerChunkRef.current ? [headerChunkRef.current, ...segChunks] : segChunks
-              blob = new Blob(parts, { type: mimeType })
+              approxMs = segChunks.length * 250
             }
-            if (isProcessing) {
-              pendingSegmentRef.current = { blob, mime: mimeType }
-              setStatus('Queued next segment...')
+
+            if (approxMs >= 900) {
+              // Prefer WAV PCM encoded from raw samples if available, else fallback to container chunks
+              let blob: Blob
+              if (pcmChunks.length > 0) {
+                const merged = mergeFloat32(pcmChunks)
+                const down = downsample(merged, sampleRateRef.current, 16000)
+                blob = encodeWavPCM16(down, 16000)
+              } else {
+                const parts = headerChunkRef.current ? [headerChunkRef.current, ...segChunks] : segChunks
+                blob = new Blob(parts, { type: mimeType })
+              }
+
+              // Track for adaptive learning (we'll update after we get the transcript)
+              lastTranscriptTimeRef.current = Date.now()
+
+              if (isProcessing) {
+                pendingSegmentRef.current = { blob, mime: mimeType }
+                setStatus('Queued next segment...')
+              } else {
+                void handleRecordedAudio(blob, mimeType)
+              }
             } else {
-              void handleRecordedAudio(blob, mimeType)
+              setStatus('Listening...')
             }
-          } else {
-            setStatus('Listening...')
           }
         }
 
@@ -1569,20 +2041,120 @@ const App = () => {
     setInputValue('')
     setIsProcessing(false)
     textAreaRef.current?.focus()
+    // Reset error recovery and feedback
+    errorRecoveryRef.current.resetErrors()
+    feedbackTimingRef.current.reset()
+    setFeedbackMessageIds(new Set())
+    // Reset PULL and ADAPT systems
+    conversationalSteeringRef.current.reset()
+    flowAdaptationRef.current.reset()
+    setCurrentSteeringCue(null)
   }
+
+  // Handler for feedback button
+  const handleFeedback = useCallback(async (messageId: string, isPositive: boolean) => {
+    try {
+      const response = await fetch(`${API_BASE}/api/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messageId,
+          feedback: isPositive ? 'positive' : 'negative',
+          timestamp: Date.now()
+        })
+      })
+
+      if (!response.ok) {
+        console.error('[Feedback] Failed to submit feedback')
+      }
+
+      // Record feedback given
+      const turnNumber = messages.filter(m => m.role === 'user').length
+      feedbackTimingRef.current.recordFeedbackGiven(turnNumber)
+    } catch (error) {
+      console.error('[Feedback] Error submitting feedback:', error)
+      throw error
+    }
+  }, [messages])
+
+  // Handler for anticipation notification
+  const handleAnticipationAccept = useCallback(() => {
+    if (currentAnticipation) {
+      console.log('[Anticipation] User accepted suggestion:', currentAnticipation.message)
+      // Send the anticipated message
+      void sendMessageFlow(currentAnticipation.message)
+      setCurrentAnticipation(null)
+    }
+  }, [currentAnticipation, sendMessageFlow])
+
+  const handleAnticipationDismiss = useCallback(() => {
+    console.log('[Anticipation] User dismissed suggestion')
+    setCurrentAnticipation(null)
+  }, [])
+
+  // Handler for confirmation dialog
+  const handleConfirmationConfirm = useCallback(() => {
+    if (pendingConfirmation) {
+      console.log('[Confirmation] User confirmed critical action')
+      setPendingConfirmation(null)
+      // Continue with the original message flow that triggered confirmation
+      // Get the last user message and process it
+      const lastUserMessage = messagesRef.current.filter(m => m.role === 'user').pop()
+      if (lastUserMessage) {
+        void sendMessageFlow(lastUserMessage.text)
+      }
+    }
+  }, [pendingConfirmation, sendMessageFlow])
+
+  const handleConfirmationCancel = useCallback(() => {
+    console.log('[Confirmation] User cancelled critical action')
+    setPendingConfirmation(null)
+    setIsProcessing(false)
+    setStatus(null)
+  }, [])
+
+  // Handler for undo button
+  const handleUndo = useCallback(() => {
+    console.log('[Undo] User requested undo')
+    const previousState = undoManagerRef.current.undo()
+    if (previousState) {
+      messagesRef.current = previousState.messages
+      setMessages(previousState.messages)
+      setShowUndoButton(false)
+      if (undoTimerRef.current) {
+        window.clearTimeout(undoTimerRef.current)
+      }
+    } else {
+      console.log('[Undo] No previous state available')
+    }
+  }, [])
+
+  // Handler for steering cue option selection
+  const handleSteeringOptionSelect = useCallback((option: string) => {
+    console.log('[PULL] User selected option:', option)
+    // Use the selected option as user input
+    void sendMessageFlow(option)
+    setCurrentSteeringCue(null)
+  }, [sendMessageFlow])
+
+  // Handler for steering cue dismissal
+  const handleSteeringDismiss = useCallback(() => {
+    console.log('[PULL] User dismissed steering cue')
+    setCurrentSteeringCue(null)
+  }, [])
 
   return (
     <div className="app-container">
       <div className="chat-card">
         <header className="chat-header">
           <div>
-            <h1>Angry Secretary</h1>
+            <h1>Girlfriend</h1>
             <p>
               Speak or type your message. Audio is transcribed with Cartesia STT, answered by
               OpenRouter, then voiced through Cartesia TTS.
             </p>
           </div>
-          <button className="clear-button" onClick={clearConversation} disabled={!messages.length}>
+          <button className="clear-button" onClick={clearConversation} disabled={!messages.length} style={{ display: 'none' }}>
             Clear
           </button>
         </header>
@@ -1601,9 +2173,8 @@ const App = () => {
             messages.map((message) => (
               <article
                 key={message.id}
-                className={`message message-${message.role} ${
-                  playingMessageId === message.id ? 'message-playing' : ''
-                }`}
+                className={`message message-${message.role} ${playingMessageId === message.id ? 'message-playing' : ''
+                  }`}
               >
                 <div className="message-label">
                   {message.role === 'user' ? 'You' : 'Assistant'}
@@ -1638,11 +2209,51 @@ const App = () => {
                     ▶️ Play Audio
                   </button>
                 )}
+                {/* Render feedback button for assistant messages */}
+                {message.role === 'assistant' &&
+                 message.status === 'complete' &&
+                 feedbackMessageIds.has(message.id) && (
+                  <FeedbackButton
+                    messageId={message.id}
+                    onFeedback={handleFeedback}
+                  />
+                )}
               </article>
             ))
           )}
           <div ref={scrollAnchorRef} />
         </section>
+
+        {/* Render AnticipationNotification */}
+        {currentAnticipation && (
+          <AnticipationNotification
+            anticipation={currentAnticipation}
+            onAccept={handleAnticipationAccept}
+            onDismiss={handleAnticipationDismiss}
+          />
+        )}
+
+        {/* Render ConfirmationDialog */}
+        {pendingConfirmation && (
+          <ConfirmationDialog
+            criticalInfo={pendingConfirmation}
+            onConfirm={handleConfirmationConfirm}
+            onCancel={handleConfirmationCancel}
+          />
+        )}
+
+        {/* Render UndoButton */}
+        <UndoButton visible={showUndoButton} onUndo={handleUndo} />
+
+        {/* Render Steering Cue (PULL principle) */}
+        {currentSteeringCue && (
+          <SteeringCue
+            cue={currentSteeringCue}
+            onOptionSelect={handleSteeringOptionSelect}
+            onDismiss={handleSteeringDismiss}
+            autoDismissMs={15000}
+          />
+        )}
 
         <footer className="composer">
           <form className="composer-form" onSubmit={handleFormSubmit}>

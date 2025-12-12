@@ -1,0 +1,83 @@
+.undo-button {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 20px;
+    background: #2196F3;
+    color: white;
+    border: none;
+    border-radius: 24px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(33, 150, 243, 0.4);
+    transition: all 0.3s;
+    animation: slideInUp 0.3s ease-out;
+    z-index: 1000;
+}
+
+@keyframes slideInUp {
+    from {
+        transform: translateX(-50%) translateY(100px);
+        opacity: 0;
+    }
+
+    to {
+        transform: translateX(-50%) translateY(0);
+        opacity: 1;
+    }
+}
+
+.undo-button:hover {
+    background: #1976D2;
+    transform: translateX(-50%) translateY(-2px);
+    box-shadow: 0 6px 20px rgba(33, 150, 243, 0.5);
+}
+
+.undo-button:active {
+    transform: translateX(-50%) translateY(0);
+}
+
+.undo-button-fading {
+    animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.6;
+    }
+}
+
+.undo-icon {
+    font-size: 20px;
+}
+
+.undo-text {
+    font-size: 15px;
+}
+
+.undo-timer {
+    font-size: 13px;
+    opacity: 0.9;
+    background: rgba(255, 255, 255, 0.2);
+    padding: 2px 8px;
+    border-radius: 12px;
+    min-width: 32px;
+    text-align: center;
+}
+
+@media (max-width: 768px) {
+    .undo-button {
+        bottom: 80px;
+    }
+}

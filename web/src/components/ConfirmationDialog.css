@@ -1,0 +1,145 @@
+.confirmation-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+    animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+.confirmation-dialog {
+    background: white;
+    border-radius: 16px;
+    padding: 24px;
+    max-width: 450px;
+    width: 90%;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+    animation: scaleIn 0.3s ease-out;
+}
+
+@keyframes scaleIn {
+    from {
+        transform: scale(0.9);
+        opacity: 0;
+    }
+
+    to {
+        transform: scale(1);
+        opacity: 1;
+    }
+}
+
+.confirmation-icon {
+    font-size: 48px;
+    text-align: center;
+    margin-bottom: 16px;
+}
+
+.confirmation-content {
+    text-align: center;
+    margin-bottom: 24px;
+}
+
+.confirmation-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: #333;
+    margin: 0 0 12px 0;
+}
+
+.confirmation-message {
+    font-size: 16px;
+    color: #666;
+    margin: 0 0 16px 0;
+    line-height: 1.5;
+}
+
+.confirmation-details {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    background: #fff3cd;
+    border-radius: 8px;
+    border: 1px solid #ffc107;
+}
+
+.confirmation-type {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #856404;
+    font-weight: 600;
+}
+
+.confirmation-detected {
+    font-size: 14px;
+    color: #333;
+    font-weight: 500;
+}
+
+.confirmation-actions {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.confirmation-btn {
+    flex: 1;
+    padding: 12px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.confirmation-btn-cancel {
+    background: #f0f0f0;
+    color: #666;
+}
+
+.confirmation-btn-cancel:hover {
+    background: #e0e0e0;
+}
+
+.confirmation-btn-confirm {
+    background: #dc3545;
+    color: white;
+}
+
+.confirmation-btn-confirm:hover {
+    background: #c82333;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(220, 53, 69, 0.3);
+}
+
+.confirmation-hint {
+    text-align: center;
+    font-size: 12px;
+    color: #999;
+    font-style: italic;
+}
+
+@media (max-width: 768px) {
+    .confirmation-dialog {
+        width: 95%;
+        padding: 20px;
+    }
+}

@@ -26,6 +26,9 @@ const FILLER_AUDIO_URLS: Record<FillerType, string[]> = {
 export class ThinkingFillerManager {
   private lastFillerTime = 0
   private options: FillerOptions
+  private currentAudio: HTMLAudioElement | null = null
+  private playbackResolve: (() => void) | null = null
+  private playbackStartTime: number = 0
 
   constructor(options: FillerOptions) {
     this.options = options
@@ -66,10 +69,53 @@ export class ThinkingFillerManager {
       const audio = new Audio(audioUrl)
       audio.volume = 0.8 // Slightly quieter than main speech
 
-      audio.onended = () => resolve()
-      audio.onerror = (err) => reject(err)
+      // Track playback state for coordination with TTS
+      this.currentAudio = audio
+      this.playbackStartTime = Date.now()
+      this.playbackResolve = resolve
 
-      audio.play().catch(reject)
+      audio.onended = () => {
+        this.cleanup()
+        resolve()
+      }
+
+      audio.onerror = (err) => {
+        this.cleanup()
+        reject(err)
+      }
+
+      audio.play().catch((err) => {
+        this.cleanup()
+        reject(err)
+      })
     })
+  }
+
+  /** Stop currently playing filler audio */
+  stopFiller(): void {
+    if (this.currentAudio) {
+      this.currentAudio.pause()
+      this.currentAudio.currentTime = 0
+    }
+    if (this.playbackResolve) {
+      this.playbackResolve()
+    }
+    this.cleanup()
+  }
+
+  /** Check if filler is currently playing */
+  isPlaying(): boolean {
+    return this.currentAudio !== null
+  }
+
+  /** Get how long the current filler has been playing (ms) */
+  getPlaybackDuration(): number {
+    return this.playbackStartTime ? Date.now() - this.playbackStartTime : 0
+  }
+
+  private cleanup(): void {
+    this.currentAudio = null
+    this.playbackResolve = null
+    this.playbackStartTime = 0
   }
 }
