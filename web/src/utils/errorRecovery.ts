@@ -219,10 +219,16 @@ export class ErrorRecovery {
         }
     }
 
-    private getFalseStartAction(_attemptNumber: number): ErrorRecoveryAction {
+    private getFalseStartAction(attemptNumber: number): ErrorRecoveryAction {
+        const messages = [
+            "Take your time. I'm listening.",
+            "No rush — I'm here.",
+            "Whenever you're ready, go ahead."
+        ]
+
         return {
             errorType: ErrorType.FALSE_START,
-            message: "Take your time. I'm listening.",
+            message: messages[Math.min(attemptNumber - 1, messages.length - 1)],
             shouldReprompt: false,
             offerTyping: false
         }

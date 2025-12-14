@@ -194,7 +194,7 @@ export class SpeculativeGenerator {
         const response = await responsePromise
         this.activeSpeculation = null
         return response
-      } catch (error) {
+      } catch {
         console.log('[Speculative] Failed to get speculative response')
         this.activeSpeculation = null
         return null

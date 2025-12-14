@@ -3,11 +3,13 @@ import { useState, useEffect } from 'react'
 interface SettingsPanelProps {
   onSilenceThresholdChange: (ms: number) => void
   onBackchannelsEnabledChange: (enabled: boolean) => void
+  onAssistantBackchannelsChange?: (enabled: boolean) => void
 }
 
 export const SettingsPanel = ({
   onSilenceThresholdChange,
-  onBackchannelsEnabledChange
+  onBackchannelsEnabledChange,
+  onAssistantBackchannelsChange
 }: SettingsPanelProps) => {
   const [silenceThreshold, setSilenceThreshold] = useState(() => {
     const saved = localStorage.getItem('silenceThreshold')
@@ -19,6 +21,12 @@ export const SettingsPanel = ({
     return saved ? saved === 'true' : true
   })
 
+  // Phase 3 (B): Assistant backchannels while user speaks
+  const [assistantBackchannelsEnabled, setAssistantBackchannelsEnabled] = useState(() => {
+    const saved = localStorage.getItem('assistantBackchannelsEnabled')
+    return saved ? saved === 'true' : false // Default to false for safety
+  })
+
   useEffect(() => {
     localStorage.setItem('silenceThreshold', silenceThreshold.toString())
     onSilenceThresholdChange(silenceThreshold)
@@ -28,6 +36,13 @@ export const SettingsPanel = ({
     localStorage.setItem('backchannelsEnabled', backchannelsEnabled.toString())
     onBackchannelsEnabledChange(backchannelsEnabled)
   }, [backchannelsEnabled, onBackchannelsEnabledChange])
+
+  useEffect(() => {
+    localStorage.setItem('assistantBackchannelsEnabled', assistantBackchannelsEnabled.toString())
+    if (onAssistantBackchannelsChange) {
+      onAssistantBackchannelsChange(assistantBackchannelsEnabled)
+    }
+  }, [assistantBackchannelsEnabled, onAssistantBackchannelsChange])
 
   const getLabel = (ms: number) => {
     if (ms < 800) return 'Faster'
@@ -69,6 +84,20 @@ export const SettingsPanel = ({
           />
           Enable thinking sounds ("hmm", "okay")
         </label>
+      </div>
+
+      <div className="setting-item">
+        <label>
+          <input
+            type="checkbox"
+            checked={assistantBackchannelsEnabled}
+            onChange={(e) => setAssistantBackchannelsEnabled(e.target.checked)}
+          />
+          Assistant backchannels while I'm speaking (headphones recommended)
+        </label>
+        <div className="setting-note" style={{ fontSize: '0.85em', color: '#888', marginTop: '4px' }}>
+          The assistant will occasionally say "mm-hmm" or "right" while you speak to show it's listening.
+        </div>
       </div>
     </div>
   )

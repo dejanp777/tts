@@ -205,13 +205,20 @@ export class FlowAdaptation {
      */
     private detectTopicShift(
         currentMessage: string,
-        _previousMessages: string[]
+        previousMessages: string[]
     ): TopicShift | null {
         const newTopic = this.extractTopic(currentMessage)
 
         if (!newTopic) return null
 
-        const previousTopic = this.context.currentTopic
+        const derivedPreviousTopic =
+            previousMessages
+                .slice(-10)
+                .map((m) => this.extractTopic(m))
+                .filter((t): t is string => Boolean(t))
+                .pop() ?? null
+
+        const previousTopic = this.context.currentTopic ?? derivedPreviousTopic
 
         // Check if returning to a stacked topic
         if (this.context.topicStack.includes(newTopic)) {

@@ -28,7 +28,14 @@ export class AnticipationEngine {
      * @param previousMessages - Previous messages in conversation
      * @returns Anticipations if any
      */
-    anticipate(currentMessage: string, _previousMessages: string[] = []): Anticipation | null {
+    anticipate(currentMessage: string, previousMessages: string[] = []): Anticipation | null {
+        // Seed history from prior context (helps after refresh/reload)
+        if (this.conversationHistory.length === 0 && previousMessages.length > 0) {
+            this.conversationHistory = previousMessages
+                .slice(-this.maxHistory)
+                .map((m) => m.toLowerCase())
+        }
+
         // Update history
         this.conversationHistory.push(currentMessage.toLowerCase())
         if (this.conversationHistory.length > this.maxHistory) {

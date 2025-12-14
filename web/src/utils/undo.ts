@@ -11,14 +11,14 @@
  * - Clear undo history
  */
 
-export interface ConversationState {
-    messages: any[]
+export interface ConversationState<TMessage = unknown> {
+    messages: TMessage[]
     timestamp: number
     stateId: string
 }
 
-export class UndoManager {
-    private history: ConversationState[] = []
+export class UndoManager<TMessage = unknown> {
+    private history: Array<ConversationState<TMessage>> = []
     private readonly maxHistory = 10
     private currentStateId = 0
 
@@ -27,9 +27,10 @@ export class UndoManager {
      * 
      * @param messages - Current messages
      */
-    saveState(messages: any[]): void {
-        const state: ConversationState = {
-            messages: JSON.parse(JSON.stringify(messages)), // Deep copy
+    saveState(messages: TMessage[]): void {
+        const clonedMessages = JSON.parse(JSON.stringify(messages)) as TMessage[] // Deep copy
+        const state: ConversationState<TMessage> = {
+            messages: clonedMessages,
             timestamp: Date.now(),
             stateId: `state_${this.currentStateId++}`
         }
@@ -49,7 +50,7 @@ export class UndoManager {
      * 
      * @returns Previous state or null if no history
      */
-    undo(): ConversationState | null {
+    undo(): ConversationState<TMessage> | null {
         if (this.history.length < 2) {
             console.log('[Undo] No history to undo')
             return null
@@ -71,7 +72,7 @@ export class UndoManager {
      * @param steps - Number of steps to undo
      * @returns Previous state or null
      */
-    undoMultiple(steps: number): ConversationState | null {
+    undoMultiple(steps: number): ConversationState<TMessage> | null {
         if (steps < 1 || steps >= this.history.length) {
             console.log('[Undo] Invalid steps:', steps)
             return null

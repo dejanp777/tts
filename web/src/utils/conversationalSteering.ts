@@ -65,7 +65,7 @@ export class ConversationalSteering {
         }
 
         // Detect multi-step processes requiring expectations
-        const expectationCue = this.detectMultiStep(lowerResponse, lowerUser)
+        const expectationCue = this.detectMultiStep(lowerResponse)
         if (expectationCue) {
             this.lastCueTime = now
             return expectationCue
@@ -125,7 +125,7 @@ export class ConversationalSteering {
     /**
      * Detects multi-step processes and sets expectations
      */
-    private detectMultiStep(response: string, _userMessage: string): ConversationalCue | null {
+    private detectMultiStep(response: string): ConversationalCue | null {
         const multiStepIndicators = [
             'first', 'then', 'next', 'after that', 'finally',
             'step 1', 'step 2', 'steps', 'process'

@@ -14,7 +14,7 @@ BACKCHANNEL_AUDIO_DIR = AUDIO_DIR / "backchannel_samples"
 SCRIPTS_DIR = FIXTURES_DIR / "scripts"
 
 # API endpoints
-API_BASE_URL = os.getenv("TEST_API_BASE_URL", "http://localhost:3000")
+API_BASE_URL = os.getenv("TEST_API_BASE_URL", "http://localhost:4000")
 API_TIMEOUT = 30  # seconds
 
 # Quality thresholds

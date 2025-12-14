@@ -12,8 +12,8 @@ import { detectMessageType, selectProsody, type ProsodyProfile } from './utils/p
 import { TwoPassEndpointer } from './utils/twoPassEndpointing'
 import { ContextAwareThreshold } from './utils/contextAwareThreshold'
 import { AdaptiveLearningSystem } from './utils/adaptiveLearning'
-// Note: classifyInterruption and detectResumeIntent available for future use
-// import { classifyInterruption, detectResumeIntent } from './utils/interruptionClassifier'
+// Phase 1 (C3): Interruption Intent Classification
+import { classifyInterruption, detectResumeIntent, type InterruptionContext } from './utils/interruptionClassifier'
 // Reserved for future verbosity adaptation:
 // import { VerbosityController } from './utils/verbosityController'
 import { MemoryManager } from './utils/conversationMemory'
@@ -28,14 +28,20 @@ import { ConversationalSteering, type ConversationalCue } from './utils/conversa
 import { FlowAdaptation } from './utils/flowAdaptation'
 import { SteeringCue } from './components/SteeringCue'
 import { ABTestingFramework, EXPERIMENTS } from './utils/abTesting'
+// Phase 2 (A): Speak-While-Generating
+import { SpeechChunker } from './utils/speechChunker'
+import { SpeechQueue, QueueState, type QueuedChunk } from './utils/speechQueue'
 
 type ChatMessage = {
   id: string
   role: 'user' | 'assistant'
   text: string
-  status?: 'pending' | 'complete' | 'error'
+  status?: 'pending' | 'complete' | 'error' | 'interrupted' | 'canceled'
   audioUrl?: string
 }
+
+// Phase 1 (C): Assistant Speech State Machine
+type AssistantSpeechState = 'idle' | 'speaking' | 'paused'
 
 // Use relative URL for API calls so it works on both desktop and mobile
 // The Cloudflare tunnel proxies both frontend and backend on the same domain
@@ -127,8 +133,9 @@ class PCMStreamPlayer {
     if (this.currentSource) {
       try {
         this.currentSource.stop()
-      } catch (e) {
+      } catch {
         // Ignore if already stopped
+        void 0
       }
       this.currentSource = null
     }
@@ -157,6 +164,7 @@ const App = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [inputValue, setInputValue] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
+  const isProcessingStateRef = useRef<boolean>(false)
   const [isRecording, setIsRecording] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState<string | null>(null)
@@ -165,15 +173,54 @@ const App = () => {
   const [audioLevels, setAudioLevels] = useState<number[]>([0, 0, 0, 0, 0]) // Audio equalizer bars
   const [autoplayBlockedMessageId, setAutoplayBlockedMessageId] = useState<string | null>(null) // Track message that needs manual play
 
+  // Phase 1 (C): Assistant Speech State Machine
+  const [assistantSpeechState, setAssistantSpeechState] = useState<AssistantSpeechState>('idle')
+  const assistantSpeechStateRef = useRef<AssistantSpeechState>('idle')
+  const playingMessageIdRef = useRef<string | null>(null)
+  const pausedAssistantMessageIdRef = useRef<string | null>(null)
+  const pausedAssistantTextRef = useRef<string>('')
+  const pausedAtChunkIndexRef = useRef<number>(0) // For Phase 2 chunk resume
+  const pausedAudioPositionRef = useRef<number>(0) // For HTMLAudio pause/resume
+
   // User preference state for Phase 1.2
   const [userSilenceThreshold, setUserSilenceThreshold] = useState(() => {
     const saved = localStorage.getItem('silenceThreshold')
     return saved ? parseInt(saved) : 1500
   })
+  const userSilenceThresholdRef = useRef<number>(userSilenceThreshold)
   const [backchannelsEnabled, setBackchannelsEnabled] = useState(() => {
     const saved = localStorage.getItem('backchannelsEnabled')
     return saved ? saved === 'true' : true
   })
+
+  // Phase 3 (B): Assistant backchannels while user speaks
+  const [assistantBackchannelsEnabled, setAssistantBackchannelsEnabled] = useState(() => {
+    const saved = localStorage.getItem('assistantBackchannelsEnabled')
+    return saved ? saved === 'true' : false
+  })
+  const assistantBackchannelsEnabledRef = useRef<boolean>(assistantBackchannelsEnabled)
+
+  // Sync isPlaying with assistantSpeechState
+  useEffect(() => {
+    assistantSpeechStateRef.current = assistantSpeechState
+    setIsPlaying(assistantSpeechState === 'speaking')
+  }, [assistantSpeechState])
+
+  useEffect(() => {
+    playingMessageIdRef.current = playingMessageId
+  }, [playingMessageId])
+
+  useEffect(() => {
+    isProcessingStateRef.current = isProcessing
+  }, [isProcessing])
+
+  useEffect(() => {
+    userSilenceThresholdRef.current = userSilenceThreshold
+  }, [userSilenceThreshold])
+
+  useEffect(() => {
+    assistantBackchannelsEnabledRef.current = assistantBackchannelsEnabled
+  }, [assistantBackchannelsEnabled])
 
   // Log API configuration on mount
   useEffect(() => {
@@ -262,7 +309,7 @@ const App = () => {
     // PCM 16
     let pos = 44
     for (let i = 0; i < samples.length; i++, pos += 2) {
-      let s = Math.max(-1, Math.min(1, samples[i]))
+      const s = Math.max(-1, Math.min(1, samples[i]))
       view.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7fff, true)
     }
 
@@ -298,7 +345,9 @@ const App = () => {
     try {
       analyserRef.current?.disconnect()
       audioContextRef.current?.close()
-    } catch { }
+    } catch (err) {
+      console.warn('[Recorder] Cleanup failed:', err)
+    }
     analyserRef.current = null
     audioContextRef.current = null
     collectingRef.current = false
@@ -352,12 +401,12 @@ const App = () => {
       resetRecorder()
     }
 
-    setIsPlaying(true)
+    setAssistantSpeechState('speaking')
     setPlayingMessageId(latestSpokenMessage.id)
     setAutoplayBlockedMessageId(null) // Clear any previous autoplay block
 
     audio.onended = () => {
-      setIsPlaying(false)
+      setAssistantSpeechState('idle')
       setPlayingMessageId(null)
       currentAudioRef.current = null
       // Resume recording after AI finishes speaking (only if full duplex is disabled)
@@ -403,7 +452,7 @@ const App = () => {
       .catch((err) => {
         console.error('Autoplay failed', err)
         setError((prev) => prev ?? 'Autoplay was blocked. Click the play button to listen.')
-        setIsPlaying(false)
+        setAssistantSpeechState('idle')
         setPlayingMessageId(null)
         setAutoplayBlockedMessageId(latestSpokenMessage.id)
         currentAudioRef.current = null
@@ -463,13 +512,13 @@ const App = () => {
     currentAudioRef.current = audio
     audio.volume = 1.0
 
-    setIsPlaying(true)
+    setAssistantSpeechState('speaking')
     setPlayingMessageId(messageId)
     setAutoplayBlockedMessageId(null)
     setError(null)
 
     audio.onended = () => {
-      setIsPlaying(false)
+      setAssistantSpeechState('idle')
       setPlayingMessageId(null)
       currentAudioRef.current = null
     }
@@ -477,11 +526,196 @@ const App = () => {
     audio.play().catch((err) => {
       console.error('Manual play failed', err)
       setError('Failed to play audio')
-      setIsPlaying(false)
+      setAssistantSpeechState('idle')
       setPlayingMessageId(null)
       currentAudioRef.current = null
     })
   }, [messages])
+
+  // Phase 1 (C4): Pause/Resume Assistant Speech
+  const pauseAssistantSpeech = useCallback(() => {
+    const enablePauseResume = import.meta.env.VITE_ENABLE_PAUSE_RESUME === 'true'
+    if (!enablePauseResume) return
+
+    console.log('[PAUSE] Pausing assistant speech')
+
+    const activeMessageId = playingMessageIdRef.current
+
+    // Phase 2 (A5): Pause speech queue if using chunked delivery
+    if (speechQueueRef.current) {
+      speechQueueRef.current.pause()
+      pausedAtChunkIndexRef.current = speechQueueRef.current.getCurrentChunkIndex()
+      console.log('[PAUSE] Paused at chunk index:', pausedAtChunkIndexRef.current)
+    }
+
+    // Pause HTMLAudio if playing
+    if (currentAudioRef.current && !currentAudioRef.current.paused) {
+      pausedAudioPositionRef.current = currentAudioRef.current.currentTime
+      currentAudioRef.current.pause()
+    }
+
+    // Pause PCM streaming audio
+    if (pcmStreamPlayerRef.current) {
+      const audioContext = pcmStreamPlayerRef.current.getAudioContext()
+      if (audioContext.state === 'running') {
+        audioContext.suspend().catch((err) => {
+          console.error('[PAUSE] Failed to suspend audio context:', err)
+        })
+      }
+    }
+
+    // Note: We do not abort in-flight streaming TTS on pause so resume can
+    // continue playback without restarting/losing audio.
+
+    // Store pause state
+    pausedAssistantMessageIdRef.current = activeMessageId
+    const message = messagesRef.current.find(m => m.id === activeMessageId)
+    if (message) {
+      pausedAssistantTextRef.current = message.text
+    }
+
+    assistantSpeechStateRef.current = 'paused'
+    setAssistantSpeechState('paused')
+    setStatus('Paused. Say "continue" to resume.')
+  }, [])
+
+  const resumeAssistantSpeech = useCallback(() => {
+    const enablePauseResume = import.meta.env.VITE_ENABLE_PAUSE_RESUME === 'true'
+    if (!enablePauseResume) return
+
+    console.log('[PAUSE] Resuming assistant speech')
+
+    // Phase 2 (A5): Resume speech queue if using chunked delivery
+    if (speechQueueRef.current && speechQueueRef.current.getState() === QueueState.PAUSED) {
+      console.log('[PAUSE] Resuming speech queue from chunk index:', pausedAtChunkIndexRef.current)
+      // Resume WebAudio playback first (the queue only controls chunk sequencing).
+      if (pcmStreamPlayerRef.current) {
+        const audioContext = pcmStreamPlayerRef.current.getAudioContext()
+        if (audioContext.state === 'suspended') {
+          audioContext.resume().catch((err) => {
+            console.error('[PAUSE] Failed to resume audio context for queue:', err)
+            setError('Failed to resume audio playback')
+          })
+        }
+      }
+      speechQueueRef.current.resume()
+      assistantSpeechStateRef.current = 'speaking'
+      setAssistantSpeechState('speaking')
+      setPlayingMessageId(pausedAssistantMessageIdRef.current)
+      setStatus(null)
+      return
+    }
+
+    // Resume HTMLAudio if available
+    if (currentAudioRef.current && currentAudioRef.current.paused && !currentAudioRef.current.ended) {
+      currentAudioRef.current.currentTime = pausedAudioPositionRef.current
+      currentAudioRef.current.play().catch((err) => {
+        console.error('[PAUSE] Failed to resume audio:', err)
+        setError('Failed to resume audio playback')
+        assistantSpeechStateRef.current = 'idle'
+        setAssistantSpeechState('idle')
+      })
+      assistantSpeechStateRef.current = 'speaking'
+      setAssistantSpeechState('speaking')
+      setPlayingMessageId(pausedAssistantMessageIdRef.current)
+      setStatus(null)
+      return
+    }
+
+    // Resume PCM streaming audio
+    if (pcmStreamPlayerRef.current) {
+      const audioContext = pcmStreamPlayerRef.current.getAudioContext()
+      if (audioContext.state === 'suspended') {
+        audioContext.resume().then(() => {
+          assistantSpeechStateRef.current = 'speaking'
+          setAssistantSpeechState('speaking')
+          setPlayingMessageId(pausedAssistantMessageIdRef.current)
+          setStatus(null)
+        }).catch((err) => {
+          console.error('[PAUSE] Failed to resume audio context:', err)
+          setError('Failed to resume audio playback')
+          assistantSpeechStateRef.current = 'idle'
+          setAssistantSpeechState('idle')
+        })
+        return
+      }
+    }
+
+    // If there's no resumable audio stream/element, re-synthesize from stored text.
+    if (pausedAssistantTextRef.current && pausedAssistantMessageIdRef.current) {
+      console.log('[PAUSE] Re-synthesizing paused text')
+      setStatus('Generating voice...')
+
+      const messageType = detectMessageType(pausedAssistantTextRef.current)
+      const prosody = selectProsody(messageType, pausedAssistantTextRef.current)
+
+      // Use streaming TTS if available
+      if (import.meta.env.VITE_ENABLE_TTS_STREAM === 'true' && pcmStreamPlayerRef.current) {
+        const player = pcmStreamPlayerRef.current
+        player.setVolume(1.0)
+
+        assistantSpeechStateRef.current = 'speaking'
+        setAssistantSpeechState('speaking')
+        setPlayingMessageId(pausedAssistantMessageIdRef.current)
+
+        const ttsController = new AbortController()
+        ttsAbortControllerRef.current = ttsController
+
+        synthesizeSpeechStream(
+          pausedAssistantTextRef.current,
+          (pcmData) => player.addChunk(pcmData),
+          ttsController.signal,
+          prosody
+        ).then(() => {
+          setStatus(null)
+        }).catch((err) => {
+          if (err.name !== 'AbortError') {
+            console.error('[PAUSE] Failed to resume TTS stream:', err)
+            setError('Failed to resume speech')
+            assistantSpeechStateRef.current = 'idle'
+            setAssistantSpeechState('idle')
+          }
+        })
+      } else {
+        // Non-streaming TTS
+        synthesizeSpeech(pausedAssistantTextRef.current, prosody).then((audioUrl) => {
+          const audio = new Audio(audioUrl)
+          currentAudioRef.current = audio
+          audio.volume = 1.0
+
+          assistantSpeechStateRef.current = 'speaking'
+          setAssistantSpeechState('speaking')
+          setPlayingMessageId(pausedAssistantMessageIdRef.current)
+
+          audio.onended = () => {
+            assistantSpeechStateRef.current = 'idle'
+            setAssistantSpeechState('idle')
+            setPlayingMessageId(null)
+            currentAudioRef.current = null
+          }
+
+          audio.play().catch((err) => {
+            console.error('[PAUSE] Failed to play resumed audio:', err)
+            setError('Failed to resume audio playback')
+            assistantSpeechStateRef.current = 'idle'
+            setAssistantSpeechState('idle')
+          })
+
+          setStatus(null)
+        }).catch((err) => {
+          console.error('[PAUSE] Failed to synthesize resumed speech:', err)
+          setError('Failed to resume speech')
+          assistantSpeechStateRef.current = 'idle'
+          setAssistantSpeechState('idle')
+        })
+      }
+    } else {
+      console.warn('[PAUSE] No paused speech to resume')
+      assistantSpeechStateRef.current = 'idle'
+      setAssistantSpeechState('idle')
+      setStatus(null)
+    }
+  }, [])
 
   // When we finish processing, auto-handle any pending recorded segment
   useEffect(() => {
@@ -705,6 +939,13 @@ const App = () => {
   // PCM Stream Player for streaming TTS
   const pcmStreamPlayerRef = useRef<PCMStreamPlayer | null>(null)
 
+  // Phase 2 (A): Speech chunker and queue refs
+  const speechChunkerRef = useRef<SpeechChunker | null>(null)
+  const speechQueueRef = useRef<SpeechQueue | null>(null)
+  // Phase 2 (A4): Track whether assistant is still generating (separate from speaking)
+  // This will be used in future UI updates to show generation status
+  const [, setAssistantGenerationState] = useState<'idle' | 'generating' | 'done'>('idle')
+
   // Phase 1.5: Thinking Filler Manager
   const fillerManagerRef = useRef<ThinkingFillerManager>(
     new ThinkingFillerManager({
@@ -731,6 +972,17 @@ const App = () => {
   const lastTranscriptRef = useRef<string>('')
   const lastTranscriptTimeRef = useRef<number>(0)
 
+  // Phase 1 (C3): Interruption context tracking
+  const lastInterruptionTranscriptRef = useRef<string>('')
+  const lastInterruptionTimeRef = useRef<number>(0)
+  const interruptionCountRef = useRef<number>(0)
+  const pauseOnBargeInRef = useRef<boolean>(false)
+
+  // Phase 3 (B2): Assistant backchannel tracking
+  const assistantBackchannelLastTimeRef = useRef<number>(0)
+  const assistantBackchannelAudioRef = useRef<HTMLAudioElement | null>(null)
+  const assistantBackchannelInhibitUntilRef = useRef<number>(0)
+
   // Interruption Classification and Verbosity Control
   // Reserved for future use in verbosity adaptation:
   // const verbosityControllerRef = useRef<VerbosityController>(new VerbosityController())
@@ -744,7 +996,7 @@ const App = () => {
   const memoryManagerRef = useRef<MemoryManager>(new MemoryManager())
   const anticipationEngineRef = useRef<AnticipationEngine>(new AnticipationEngine())
   const reflectionEngineRef = useRef<ReflectionEngine>(new ReflectionEngine())
-  const undoManagerRef = useRef<UndoManager>(new UndoManager())
+  const undoManagerRef = useRef<UndoManager<ChatMessage>>(new UndoManager<ChatMessage>())
 
   const [currentAnticipation, setCurrentAnticipation] = useState<Anticipation | null>(null)
   const [pendingConfirmation, setPendingConfirmation] = useState<CriticalInfo | null>(null)
@@ -1001,6 +1253,7 @@ const App = () => {
         const enableChatStream = import.meta.env.VITE_ENABLE_CHAT_STREAM === 'true' || false
         let assistantText = ''
         const assistantId = createId()
+        let usedSpeakWhileGenerating = false
 
         if (enableChatStream) {
           // Use streaming chat - show tokens as they arrive
@@ -1021,6 +1274,81 @@ const App = () => {
           messagesRef.current = conversationWithAssistant
           setMessages(conversationWithAssistant)
 
+          // Phase 2 (A): Initialize speech chunker and queue if speak-while-generating enabled
+          const enableSpeakWhileGenerating = import.meta.env.VITE_ENABLE_SPEAK_WHILE_GENERATING === 'true'
+
+          if (enableSpeakWhileGenerating && ENABLE_TTS_STREAM) {
+            console.log('[SAY-STREAM] Initializing speak-while-generating mode')
+            usedSpeakWhileGenerating = true
+            setAssistantGenerationState('generating')
+
+            // Initialize PCM player if not already created
+            if (!pcmStreamPlayerRef.current) {
+              pcmStreamPlayerRef.current = new PCMStreamPlayer(44100)
+            }
+
+            // Initialize speech chunker with env config
+            speechChunkerRef.current = new SpeechChunker({
+              minChars: parseInt(import.meta.env.VITE_SPEECH_CHUNK_MIN_CHARS || '60'),
+              maxChars: parseInt(import.meta.env.VITE_SPEECH_CHUNK_MAX_CHARS || '220'),
+              forceAfterMs: parseInt(import.meta.env.VITE_SPEECH_CHUNK_FORCE_AFTER_MS || '1800')
+            })
+
+            // Initialize speech queue
+            const player = pcmStreamPlayerRef.current
+            player.setVolume(1.0)
+
+            // Set up playback state when first chunk starts
+            let isFirstChunk = true
+
+            speechQueueRef.current = new SpeechQueue(
+              async (chunk: QueuedChunk) => {
+                console.log('[SAY-STREAM] Playing queued chunk:', chunk.index)
+
+                // Set playing state on first chunk
+                if (isFirstChunk) {
+                  isFirstChunk = false
+                  setAssistantSpeechState('speaking')
+                  setPlayingMessageId(assistantId)
+
+                  // Stop thinking filler if playing
+                  if (fillerManagerRef.current.isPlaying()) {
+                    fillerManagerRef.current.stopFiller()
+                  }
+                }
+
+                // Detect message type and select prosody
+                const messageType = detectMessageType(chunk.text)
+                const prosody = selectProsody(messageType, chunk.text)
+
+                // Synthesize this chunk
+                const ttsController = new AbortController()
+                ttsAbortControllerRef.current = ttsController
+
+                await synthesizeSpeechStream(
+                  chunk.text,
+                  (pcmData) => player.addChunk(pcmData),
+                  ttsController.signal,
+                  prosody
+                )
+              },
+              () => {
+                // On complete
+                console.log('[SAY-STREAM] All chunks played')
+                setAssistantSpeechState('idle')
+                setPlayingMessageId(null)
+                setAssistantGenerationState('done')
+              },
+              (error) => {
+                // On error
+                console.error('[SAY-STREAM] Queue error:', error)
+                setAssistantSpeechState('idle')
+                setPlayingMessageId(null)
+                setAssistantGenerationState('done')
+              }
+            )
+          }
+
           let firstTokenTime: number | null = null
           // Stream tokens and update message in real-time
           assistantText = await requestChatCompletionStream(conversationWithUser, (token) => {
@@ -1031,13 +1359,41 @@ const App = () => {
             assistantMessage.text += token
             messagesRef.current = [...conversationWithUser, assistantMessage]
             setMessages([...conversationWithUser, assistantMessage])
+
+            // Phase 2 (A): Feed token to speech chunker if enabled
+            if (enableSpeakWhileGenerating && speechChunkerRef.current && speechQueueRef.current) {
+              const chunk = speechChunkerRef.current.addToken(token)
+              if (chunk) {
+                console.log('[SAY-STREAM] Chunk emitted from token stream:', { index: chunk.index, length: chunk.text.length })
+                speechQueueRef.current.enqueue({
+                  text: chunk.text,
+                  index: chunk.index,
+                  isFinal: chunk.isFinal
+                })
+              }
+            }
           })
 
           const chatEndTime = performance.now()
           console.log(`⏱️ [TIMING] Chat complete took ${(chatEndTime - chatStartTime).toFixed(0)}ms`)
 
+          // Phase 2 (A): Flush final chunk if speak-while-generating enabled
+          if (enableSpeakWhileGenerating && speechChunkerRef.current && speechQueueRef.current) {
+            const finalChunk = speechChunkerRef.current.flush()
+            if (finalChunk) {
+              console.log('[SAY-STREAM] Flushing final chunk:', { index: finalChunk.index, length: finalChunk.text.length })
+              speechQueueRef.current.enqueue({
+                text: finalChunk.text,
+                index: finalChunk.index,
+                isFinal: true
+              })
+            }
+            setAssistantGenerationState('done')
+          }
+
           // Update with final text
           assistantMessage.text = assistantText
+          assistantMessage.status = 'complete'
           messagesRef.current = [...conversationWithUser, assistantMessage]
           setMessages([...conversationWithUser, assistantMessage])
         } else {
@@ -1093,9 +1449,13 @@ const App = () => {
           fillerPlaybackRef.current = null
         }
 
-        setStatus('Generating voice...')
-
-        if (ENABLE_TTS_STREAM) {
+        // Phase 2 (A): If speak-while-generating is active, chunks are already queued for playback.
+        // Avoid synthesizing the full assistantText again (would double-speak).
+        if (usedSpeakWhileGenerating) {
+          console.log('[SAY-STREAM] Skipping full-answer TTS (chunk queue active)')
+          setStatus(null)
+        } else if (ENABLE_TTS_STREAM) {
+          setStatus('Generating voice...')
           // Use streaming TTS
           console.log('[TTS] Using streaming mode')
           const ttsStartTime = performance.now()
@@ -1121,11 +1481,11 @@ const App = () => {
           }
 
           // Set up playback state tracking
-          setIsPlaying(true)
+          setAssistantSpeechState('speaking')
           setPlayingMessageId(assistantId)
 
           player.onEnded(() => {
-            setIsPlaying(false)
+            setAssistantSpeechState('idle')
             setPlayingMessageId(null)
           })
 
@@ -1165,6 +1525,7 @@ const App = () => {
           setMessages(finalizedMessages)
           setStatus(null)
         } else {
+          setStatus('Generating voice...')
           // Use non-streaming TTS (original behavior)
           // Phase 1.6: Detect message type and select appropriate prosody
           const messageType = detectMessageType(assistantText)
@@ -1196,13 +1557,13 @@ const App = () => {
               audio.volume = 1.0
               currentAudioRef.current = audio
 
-              setIsPlaying(true)
+              setAssistantSpeechState('speaking')
               setPlayingMessageId(assistantId)
 
               // Wait for chunk to finish playing
               await new Promise<void>((resolve, reject) => {
                 audio.onended = () => {
-                  setIsPlaying(false)
+                  setAssistantSpeechState('idle')
                   setPlayingMessageId(null)
                   currentAudioRef.current = null
                   resolve()
@@ -1264,7 +1625,10 @@ const App = () => {
             void speculativeGeneratorRef.current.startSpeculation(
               prediction.text,
               prediction.confidence,
-              async (text, _signal) => {
+              async (text, signal) => {
+                if (signal.aborted) {
+                  throw new DOMException('Aborted', 'AbortError')
+                }
                 // Use the existing request function with the speculative text
                 const speculativeHistory = [
                   ...messagesRef.current,
@@ -1310,13 +1674,23 @@ const App = () => {
         // Handle AbortError gracefully (from barge-in)
         if (err instanceof Error && err.name === 'AbortError') {
           console.log('[Barge-in] Request aborted by user')
-          setStatus('Interrupted. Listening...')
+          const pausedByBargeIn = pauseOnBargeInRef.current
+          pauseOnBargeInRef.current = false
+
+          if (pausedByBargeIn) {
+            setStatus('Paused. Say "continue" to resume.')
+          } else {
+            setStatus('Interrupted. Listening...')
+          }
           setError(null)
 
-          // Remove pending messages
-          const recoveredMessages: ChatMessage[] = messagesRef.current.filter((entry) =>
-            entry.status !== 'pending'
-          )
+          // If we paused due to barge-in, preserve the partial assistant message for resume.
+          // Otherwise, keep the existing behavior (drop pending messages).
+          const recoveredMessages: ChatMessage[] = pausedByBargeIn
+            ? messagesRef.current.map((entry) =>
+                entry.status === 'pending' ? { ...entry, status: 'interrupted' as const } : entry
+              )
+            : messagesRef.current.filter((entry) => entry.status !== 'pending')
           messagesRef.current = recoveredMessages
           setMessages(recoveredMessages)
         } else {
@@ -1369,10 +1743,11 @@ const App = () => {
 
   const handleRecordedAudio = useCallback(
     async (blob: Blob, mime: string) => {
-      console.log('[handleRecordedAudio] Called. isProcessing:', isProcessingRef.current, 'isRecording:', isRecording)
+      console.log('[handleRecordedAudio] Called. isProcessingRef:', isProcessingRef.current)
 
       if (isProcessingRef.current) {
-        setError('Wait for the current response to finish before recording again.')
+        pendingSegmentRef.current = { blob, mime }
+        setStatus('Queued next segment...')
         return
       }
 
@@ -1383,13 +1758,139 @@ const App = () => {
       setStatus('Transcribing audio...')
       setError(null)
 
-      console.log('[handleRecordedAudio] Set isProcessing=true, isRecording is still:', isRecording)
+      console.log('[handleRecordedAudio] Set isProcessing=true')
 
       try {
         const t0 = performance.now()
         const transcript = await transcribeAudio(blob, encoding)
         const t1 = performance.now()
         console.log(`⏱️ [TIMING] STT took ${(t1 - t0).toFixed(0)}ms`)
+
+        // Phase 1 (C3): Check for resume intent if assistant is paused
+        const enableInterruptIntent = import.meta.env.VITE_ENABLE_INTERRUPT_INTENT === 'true'
+        const enablePauseResume = import.meta.env.VITE_ENABLE_PAUSE_RESUME === 'true'
+
+        const assistantSpeechStateNow = assistantSpeechStateRef.current
+
+        if (enablePauseResume && assistantSpeechStateNow === 'paused') {
+          if (detectResumeIntent(transcript)) {
+            console.log('[INTENT] Resume intent detected')
+            resumeAssistantSpeech()
+            setIsProcessing(false)
+            isProcessingRef.current = false
+            return
+          }
+        }
+
+        // Phase 1 (C3): Classify interruption if AI is speaking or paused
+        if (enableInterruptIntent && assistantSpeechStateNow !== 'idle') {
+          const currentTime = Date.now()
+          const timeSinceLastInterruption = lastInterruptionTimeRef.current
+            ? currentTime - lastInterruptionTimeRef.current
+            : Infinity
+
+          const context: InterruptionContext = {
+            transcript,
+            previousTranscript: lastInterruptionTranscriptRef.current,
+            timeSinceLastInterruption,
+            interruptionCount: interruptionCountRef.current,
+            isAISpeaking: true
+          }
+
+          const interruptionResult = classifyInterruption(context)
+          console.log('[INTENT] Interruption classified:', {
+            type: interruptionResult.type,
+            confidence: interruptionResult.confidence,
+            reason: interruptionResult.reason
+          })
+
+          // Update interruption tracking
+          lastInterruptionTranscriptRef.current = transcript
+          lastInterruptionTimeRef.current = currentTime
+          if (timeSinceLastInterruption < 10000) {
+            interruptionCountRef.current++
+          } else {
+            interruptionCountRef.current = 1
+          }
+
+          // Route by interruption type
+          if (interruptionResult.type === 'PAUSE') {
+            console.log('[INTENT] Pause requested')
+            pauseAssistantSpeech()
+            setIsProcessing(false)
+            isProcessingRef.current = false
+            return
+          }
+
+          const stopAssistantPlayback = (reason: string) => {
+            console.log('[INTENT] Stopping assistant:', reason)
+            const activeMessageId = playingMessageIdRef.current ?? pausedAssistantMessageIdRef.current
+
+            // Abort speech queue and in-flight requests
+            if (speechQueueRef.current) {
+              console.log('[SAY-STREAM] Aborting speech queue:', reason)
+              speechQueueRef.current.abort()
+            }
+            if (chatAbortControllerRef.current) {
+              console.log('[SAY-STREAM] Aborting chat stream:', reason)
+              chatAbortControllerRef.current.abort()
+              chatAbortControllerRef.current = null
+            }
+            if (ttsAbortControllerRef.current) {
+              console.log('[SAY-STREAM] Aborting TTS:', reason)
+              ttsAbortControllerRef.current.abort()
+              ttsAbortControllerRef.current = null
+            }
+
+            // Stop assistant playback
+            if (currentAudioRef.current) {
+              currentAudioRef.current.pause()
+              currentAudioRef.current = null
+            }
+	            if (pcmStreamPlayerRef.current) {
+	              pcmStreamPlayerRef.current.stop()
+	              const audioContext = pcmStreamPlayerRef.current.getAudioContext()
+	              if (audioContext.state === 'suspended') {
+	                audioContext.resume().catch((err) => {
+	                  console.error('[INTENT] Failed to resume audio context after stop:', err)
+	                })
+	              }
+	            }
+
+            // Clear paused state if any
+            pausedAssistantMessageIdRef.current = null
+            pausedAssistantTextRef.current = ''
+            pausedAtChunkIndexRef.current = 0
+            pausedAudioPositionRef.current = 0
+
+            assistantSpeechStateRef.current = 'idle'
+            setAssistantSpeechState('idle')
+            setPlayingMessageId(null)
+            setAssistantGenerationState('idle')
+
+            // Mark the interrupted assistant message (if present)
+            if (activeMessageId) {
+              const updatedMessages = messagesRef.current.map(m => {
+                if (m.id === activeMessageId && m.role === 'assistant') {
+                  return { ...m, status: 'interrupted' as const }
+                }
+                return m
+              })
+              setMessages(updatedMessages)
+              messagesRef.current = updatedMessages
+            }
+          }
+
+          if (interruptionResult.type === 'CORRECTION' || interruptionResult.type === 'TOPIC_SHIFT') {
+            stopAssistantPlayback('correction/topic shift')
+          } else if (interruptionResult.type === 'IMPATIENCE') {
+            stopAssistantPlayback('impatience')
+            // TODO: Integrate with verbosityController to reduce response length
+          } else if (interruptionResult.type === 'BARGE_IN') {
+            stopAssistantPlayback('barge-in')
+          }
+          // For other types, continue with normal flow
+        }
 
         // Phase 3: Adaptive Learning - Provide feedback based on user interaction
         if (transcript && transcript.trim()) {
@@ -1407,16 +1908,16 @@ const App = () => {
             )
 
             if (isInterruption) {
-              adaptiveLearningRef.current.updateFromFeedback({
-                type: 'interruption',
-                timestamp: currentTime,
-                context: {
-                  threshold: userSilenceThreshold,
-                  silenceDuration: timeSinceLastTranscript,
-                  transcriptLength: transcript.length
+                  adaptiveLearningRef.current.updateFromFeedback({
+                    type: 'interruption',
+                    timestamp: currentTime,
+                    context: {
+                      threshold: userSilenceThresholdRef.current,
+                      silenceDuration: timeSinceLastTranscript,
+                      transcriptLength: transcript.length
+                    }
+                  })
                 }
-              })
-            }
           }
 
           // Update last transcript for next comparison
@@ -1510,6 +2011,14 @@ const App = () => {
         }
 
         if (typeof message === 'string' && message.toLowerCase().includes('empty result')) {
+          // Phase 1 (C2): Log if this was a control utterance attempt
+          const wasControlMode =
+            (import.meta.env.VITE_ENABLE_INTERRUPT_INTENT === 'true') &&
+            (assistantSpeechStateRef.current === 'speaking' || assistantSpeechStateRef.current === 'paused')
+          if (wasControlMode) {
+            console.log('[CONTROL] Empty STT result in control mode - treating as normal interruption')
+          }
+
           // Classify as NO_MATCH error
           const errorType = errorRecoveryRef.current.classifyError(errorContext)
           const recoveryAction = errorRecoveryRef.current.getRecoveryAction(errorType)
@@ -1542,7 +2051,7 @@ const App = () => {
         setIsProcessing(false)
       }
     },
-    [sendMessageFlow, transcribeAudio]
+    [sendMessageFlow, transcribeAudio, pauseAssistantSpeech, resumeAssistantSpeech]
     // Note: isProcessing removed from deps to prevent recorder reset during processing
   )
 
@@ -1609,7 +2118,15 @@ const App = () => {
       setStatus('Listening...')
 
       // Setup a simple VAD using AnalyserNode RMS energy + capture raw PCM via ScriptProcessor
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+      const AudioContextCtor =
+        window.AudioContext ||
+        (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+
+      if (!AudioContextCtor) {
+        throw new Error('AudioContext is not supported in this browser.')
+      }
+
+      const audioCtx = new AudioContextCtor()
       const source = audioCtx.createMediaStreamSource(stream)
       const analyser = audioCtx.createAnalyser()
       analyser.fftSize = 2048
@@ -1639,15 +2156,83 @@ const App = () => {
       const maxSilenceMs = userSilenceThreshold
       const interval = 50
 
+      // Phase 1 (C2): Control utterance capture thresholds
+      const enableControlCapture = import.meta.env.VITE_ENABLE_INTERRUPT_INTENT === 'true'
+      const enablePauseResume = import.meta.env.VITE_ENABLE_PAUSE_RESUME === 'true'
+      const minControlUtteranceMs = parseInt(import.meta.env.VITE_MIN_CONTROL_UTTERANCE_MS || '300')
+      const minControlSilenceMs = parseInt(import.meta.env.VITE_MIN_CONTROL_SILENCE_MS || '200')
+
       vadTimerRef.current = window.setInterval(() => {
         if (!analyserRef.current) return
         analyserRef.current.getFloatTimeDomainData(data)
         let sum = 0
         for (let i = 0; i < data.length; i++) sum += data[i] * data[i]
         const rms = Math.sqrt(sum / data.length)
+        const isAssistantSpeaking = assistantSpeechStateRef.current === 'speaking'
         // Use dynamic threshold: raise it during AI playback to reduce false positives
-        const thresholdRms = isPlaying ? baseThresholdRms * 1.5 : baseThresholdRms
+        const thresholdRms = isAssistantSpeaking ? baseThresholdRms * 1.5 : baseThresholdRms
         const speaking = rms > thresholdRms
+
+        // Phase 1 (C2): Determine if in control capture mode (used throughout VAD loop)
+        const isControlCaptureMode =
+          enableControlCapture &&
+          (assistantSpeechStateRef.current === 'speaking' || assistantSpeechStateRef.current === 'paused')
+
+        // Phase 3 (B2): Assistant backchannel scheduler
+        const enableAssistantBackchannels =
+          import.meta.env.VITE_ENABLE_ASSISTANT_BACKCHANNELS === 'true' &&
+          assistantBackchannelsEnabledRef.current
+        const minUserSpeechMs = parseInt(import.meta.env.VITE_ASSISTANT_BACKCHANNEL_MIN_USER_SPEECH_MS || '1800')
+        const minIntervalMs = parseInt(import.meta.env.VITE_ASSISTANT_BACKCHANNEL_MIN_INTERVAL_MS || '8000')
+        const backchannelVolume = parseFloat(import.meta.env.VITE_ASSISTANT_BACKCHANNEL_VOLUME || '0.20')
+
+	        if (enableAssistantBackchannels &&
+	            speaking &&
+	            voiceMsRef.current >= minUserSpeechMs &&
+	            silenceMsRef.current === 0 &&
+	            assistantSpeechStateRef.current === 'idle' &&
+	            !isProcessingRef.current &&
+	            Date.now() - assistantBackchannelLastTimeRef.current >= minIntervalMs &&
+	            Date.now() >= assistantBackchannelInhibitUntilRef.current) {
+
+          console.log('[BACKCHANNEL-AI] Triggering assistant backchannel')
+
+          // Play a simple acknowledgment backchannel
+          const backchannelPhrases = ['mm-hmm', 'yeah', 'okay', 'right', 'I see']
+          const randomPhrase = backchannelPhrases[Math.floor(Math.random() * backchannelPhrases.length)]
+
+          // Use existing TTS synthesis for the backchannel
+          const backchannelProsody: ProsodyProfile = {
+            emotion: 'neutral',
+            speed: 1.1,
+            energy: 0.5
+          }
+          synthesizeSpeech(randomPhrase, backchannelProsody)
+            .then((audioUrl) => {
+              if (assistantBackchannelAudioRef.current) {
+                assistantBackchannelAudioRef.current.pause()
+              }
+
+              const audio = new Audio(audioUrl)
+              audio.volume = backchannelVolume
+              assistantBackchannelAudioRef.current = audio
+
+              audio.play().catch((err) => {
+                console.error('[BACKCHANNEL-AI] Failed to play backchannel:', err)
+              })
+
+              audio.onended = () => {
+                assistantBackchannelAudioRef.current = null
+                // Set inhibit window after backchannel
+                assistantBackchannelInhibitUntilRef.current = Date.now() + 500
+              }
+
+              assistantBackchannelLastTimeRef.current = Date.now()
+            })
+            .catch((err) => {
+              console.error('[BACKCHANNEL-AI] Failed to synthesize backchannel:', err)
+            })
+        }
 
         // Update equalizer visualization
         const numBars = 5
@@ -1701,7 +2286,7 @@ const App = () => {
           }
         }
 
-        if (enableDucking && isPlaying) {
+        if (enableDucking && isAssistantSpeaking) {
           // Classify the current user audio
           const classification = classifyUserAudio(
             voiceMsRef.current,
@@ -1737,7 +2322,7 @@ const App = () => {
         const enableBargeIn = import.meta.env.VITE_ENABLE_BARGE_IN === 'true' || false
         const bargeInThresholdMs = 300 // Require 300ms of sustained speech to trigger barge-in
 
-        if (enableBargeIn && isPlaying && speaking) {
+        if (enableBargeIn && isAssistantSpeaking && speaking) {
           // Extract audio features for classification
           const audioFeatures = extractAudioFeatures(
             data,
@@ -1746,13 +2331,13 @@ const App = () => {
           )
 
           // Classify the audio (backchannel vs. interruption)
-          const backchannelClassification = classifyBackchannel(audioFeatures, isPlaying)
+          const backchannelClassification = classifyBackchannel(audioFeatures, isAssistantSpeaking)
 
           console.log('[Audio Classification]', {
             type: backchannelClassification.type,
             confidence: backchannelClassification.confidence,
             features: audioFeatures,
-            aiSpeaking: isPlaying
+            aiSpeaking: isAssistantSpeaking
           })
 
           // Only trigger barge-in for real interruptions, not backchannels
@@ -1762,30 +2347,42 @@ const App = () => {
 
             console.log('[Barge-in] User interrupted AI (not a backchannel)')
 
-            // Abort in-flight requests
-            if (chatAbortControllerRef.current) {
-              chatAbortControllerRef.current.abort()
-              chatAbortControllerRef.current = null
-            }
-            if (ttsAbortControllerRef.current) {
-              ttsAbortControllerRef.current.abort()
-              ttsAbortControllerRef.current = null
-            }
+            const shouldPauseInsteadOfStop = enableControlCapture && enablePauseResume
 
-            // Stop audio playback
-            if (currentAudioRef.current) {
-              currentAudioRef.current.pause()
-              currentAudioRef.current = null
-            }
+            if (shouldPauseInsteadOfStop) {
+              // Pause immediately to allow control utterances; intent routing happens after STT.
+              // Do not abort chat/TTS here so resume can continue naturally.
+              pauseAssistantSpeech()
+            } else {
+              // Abort in-flight requests
+              if (speechQueueRef.current) {
+                speechQueueRef.current.abort()
+              }
+              if (chatAbortControllerRef.current) {
+                chatAbortControllerRef.current.abort()
+                chatAbortControllerRef.current = null
+              }
+              if (ttsAbortControllerRef.current) {
+                ttsAbortControllerRef.current.abort()
+                ttsAbortControllerRef.current = null
+              }
 
-            // Stop streaming audio if using streaming TTS
-            if (pcmStreamPlayerRef.current) {
-              pcmStreamPlayerRef.current.stop()
-            }
+              // Stop audio playback
+              if (currentAudioRef.current) {
+                currentAudioRef.current.pause()
+                currentAudioRef.current = null
+              }
 
-            setIsPlaying(false)
-            setPlayingMessageId(null)
-            setStatus('Interrupted. Listening...')
+              // Stop streaming audio if using streaming TTS
+              if (pcmStreamPlayerRef.current) {
+                pcmStreamPlayerRef.current.stop()
+              }
+
+              assistantSpeechStateRef.current = 'idle'
+              setAssistantSpeechState('idle')
+              setPlayingMessageId(null)
+              setStatus('Interrupted. Listening...')
+            }
           } else if (backchannelClassification.type === 'BACKCHANNEL') {
             console.log('[Backchannel] Detected, not interrupting AI')
             // Don't interrupt, just acknowledge in logs
@@ -1879,7 +2476,16 @@ const App = () => {
                     approxMs = segChunks.length * 250
                   }
 
-                  if (approxMs >= 900) {
+                  // Phase 1 (C2): Allow shorter segments for control utterances during AI speech
+                  const minSegmentMs = isControlCaptureMode ? minControlUtteranceMs : 900
+
+                  if (approxMs >= minSegmentMs) {
+                    console.log('[VAD] Processing segment:', {
+                      duration: approxMs,
+                      isControlMode: isControlCaptureMode,
+                      minRequired: minSegmentMs
+                    })
+
                     let blob: Blob
                     if (pcmChunks.length > 0) {
                       const merged = mergeFloat32(pcmChunks)
@@ -1889,7 +2495,7 @@ const App = () => {
                       const parts = headerChunkRef.current ? [headerChunkRef.current, ...segChunks] : segChunks
                       blob = new Blob(parts, { type: mimeType })
                     }
-                    if (isProcessing) {
+                    if (isProcessingStateRef.current) {
                       pendingSegmentRef.current = { blob, mime: mimeType }
                       setStatus('Queued next segment...')
                     } else {
@@ -1906,25 +2512,37 @@ const App = () => {
         }
 
         // Phase 3: Intelligent Endpointing with Two-Pass Validation
-        if (collectingRef.current && silenceMsRef.current >= minSilenceMs) {
+        // Phase 1 (C2): Use shorter silence threshold for control mode
+        const effectiveMinSilence = isControlCaptureMode ? Math.min(minSilenceMs, minControlSilenceMs) : minSilenceMs
+
+        if (collectingRef.current && silenceMsRef.current >= effectiveMinSilence) {
           // Get current partial transcript if available (we don't have it in this implementation)
           // For now, we'll use empty string and rely on acoustic features
           const partialTranscript = ''
 
-          // Calculate context-aware threshold
-          const turnNumber = messages.filter(m => m.role === 'user').length + 1
-          const contextThreshold = contextAwareThresholdRef.current.calculateThreshold({
-            turnNumber,
-            transcriptLength: partialTranscript.length,
-            userHistory: {
-              interruptionRate: adaptiveLearningRef.current.getProfile().stats.interruptionRate,
-              averageTurnLength: adaptiveLearningRef.current.getProfile().stats.averageTurnLength
-            }
-          })
+          // Calculate context-aware threshold (skip for control mode to allow quick endpointing)
+          let effectiveThreshold: number
+          let contextThreshold: number = 0
+          let adaptiveThreshold: number = 0
 
-          // Use adaptive learning threshold if available, otherwise use context-aware threshold
-          const adaptiveThreshold = adaptiveLearningRef.current.getOptimalThreshold()
-          const effectiveThreshold = Math.max(contextThreshold, adaptiveThreshold)
+          if (isControlCaptureMode) {
+            effectiveThreshold = minControlSilenceMs
+            console.log('[CONTROL] Using fast control mode threshold:', effectiveThreshold)
+          } else {
+            const turnNumber = messagesRef.current.filter(m => m.role === 'user').length + 1
+            contextThreshold = contextAwareThresholdRef.current.calculateThreshold({
+              turnNumber,
+              transcriptLength: partialTranscript.length,
+              userHistory: {
+                interruptionRate: adaptiveLearningRef.current.getProfile().stats.interruptionRate,
+                averageTurnLength: adaptiveLearningRef.current.getProfile().stats.averageTurnLength
+              }
+            })
+
+            // Use adaptive learning threshold if available, otherwise use context-aware threshold
+            adaptiveThreshold = adaptiveLearningRef.current.getOptimalThreshold()
+            effectiveThreshold = Math.max(contextThreshold, adaptiveThreshold)
+          }
 
           // Update two-pass endpointer with current threshold
           twoPassEndpointerRef.current.updateThreshold(effectiveThreshold)
@@ -1975,7 +2593,16 @@ const App = () => {
               approxMs = segChunks.length * 250
             }
 
-            if (approxMs >= 900) {
+            // Phase 1 (C2): Allow shorter segments for control utterances during AI speech
+            const minSegmentMs = isControlCaptureMode ? minControlUtteranceMs : 900
+
+            if (approxMs >= minSegmentMs) {
+              console.log('[VAD] Processing segment:', {
+                duration: approxMs,
+                isControlMode: isControlCaptureMode,
+                minRequired: minSegmentMs
+              })
+
               // Prefer WAV PCM encoded from raw samples if available, else fallback to container chunks
               let blob: Blob
               if (pcmChunks.length > 0) {
@@ -1990,7 +2617,7 @@ const App = () => {
               // Track for adaptive learning (we'll update after we get the transcript)
               lastTranscriptTimeRef.current = Date.now()
 
-              if (isProcessing) {
+              if (isProcessingStateRef.current) {
                 pendingSegmentRef.current = { blob, mime: mimeType }
                 setStatus('Queued next segment...')
               } else {
@@ -2007,12 +2634,13 @@ const App = () => {
         }
       }, interval)
       setError(null)
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err)
-      if (err && (err.name === 'NotFoundError' || err.name === 'OverconstrainedError')) {
+      const errorName = err instanceof Error ? err.name : undefined
+      if (errorName && (errorName === 'NotFoundError' || errorName === 'OverconstrainedError')) {
         setError('No matching microphone found. Select a different device and try again.')
         void refreshDevices()
-      } else if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
+      } else if (errorName && (errorName === 'NotAllowedError' || errorName === 'SecurityError')) {
         setError('Microphone permission denied. Allow access in the browser and OS settings.')
       } else {
         setError('Failed to access microphone. Please grant permission and try again.')
@@ -2020,7 +2648,7 @@ const App = () => {
       setStatus(null)
       resetRecorder()
     }
-  }, [handleRecordedAudio, mimeType, resetRecorder, selectedMicId, refreshDevices, userSilenceThreshold, isPlaying])
+  }, [handleRecordedAudio, mimeType, resetRecorder, selectedMicId, refreshDevices, userSilenceThreshold, pauseAssistantSpeech, synthesizeSpeech])
 
   // Auto start/refresh when selection changes
   useEffect(() => {
@@ -2069,7 +2697,7 @@ const App = () => {
       }
 
       // Record feedback given
-      const turnNumber = messages.filter(m => m.role === 'user').length
+        const turnNumber = messagesRef.current.filter(m => m.role === 'user').length
       feedbackTimingRef.current.recordFeedbackGiven(turnNumber)
     } catch (error) {
       console.error('[Feedback] Error submitting feedback:', error)
@@ -2162,6 +2790,7 @@ const App = () => {
         <SettingsPanel
           onSilenceThresholdChange={setUserSilenceThreshold}
           onBackchannelsEnabledChange={setBackchannelsEnabled}
+          onAssistantBackchannelsChange={setAssistantBackchannelsEnabled}
         />
 
         <section className="messages">
@@ -2209,6 +2838,28 @@ const App = () => {
                     ▶️ Play Audio
                   </button>
                 )}
+                {/* Phase 1 (C4): Pause/Resume UI buttons */}
+                {import.meta.env.VITE_ENABLE_PAUSE_RESUME === 'true' &&
+                 playingMessageId === message.id &&
+                 assistantSpeechState === 'speaking' && (
+                  <button
+                    className="pause-button"
+                    onClick={pauseAssistantSpeech}
+                    style={{
+                      marginTop: '8px',
+                      marginLeft: '8px',
+                      padding: '8px 16px',
+                      backgroundColor: '#FF9800',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      fontSize: '14px',
+                    }}
+                  >
+                    ⏸️ Pause
+                  </button>
+                )}
                 {/* Render feedback button for assistant messages */}
                 {message.role === 'assistant' &&
                  message.status === 'complete' &&
@@ -2244,6 +2895,100 @@ const App = () => {
 
         {/* Render UndoButton */}
         <UndoButton visible={showUndoButton} onUndo={handleUndo} />
+
+        {/* Phase 1 (C4): Resume/Stop buttons when paused */}
+        {import.meta.env.VITE_ENABLE_PAUSE_RESUME === 'true' && assistantSpeechState === 'paused' && (
+          <div style={{
+            position: 'fixed',
+            bottom: '120px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            backgroundColor: 'rgba(0, 0, 0, 0.85)',
+            color: 'white',
+            padding: '16px 24px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
+            zIndex: 1000,
+            display: 'flex',
+            gap: '12px',
+            alignItems: 'center'
+          }}>
+            <span>⏸️ Paused</span>
+            <button
+              onClick={resumeAssistantSpeech}
+              style={{
+                padding: '8px 16px',
+                backgroundColor: '#4CAF50',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '14px',
+              }}
+            >
+              ▶️ Resume
+            </button>
+	            <button
+	              onClick={() => {
+	                console.log('[PAUSE] Discarding paused speech')
+	                // Abort speech queue and in-flight requests
+	                if (speechQueueRef.current) {
+	                  speechQueueRef.current.abort()
+	                }
+	                if (chatAbortControllerRef.current) {
+	                  chatAbortControllerRef.current.abort()
+	                  chatAbortControllerRef.current = null
+	                }
+	                if (ttsAbortControllerRef.current) {
+	                  ttsAbortControllerRef.current.abort()
+	                  ttsAbortControllerRef.current = null
+	                }
+
+	                // Stop any playing audio (assistant + backchannels)
+	                if (assistantBackchannelAudioRef.current) {
+	                  assistantBackchannelAudioRef.current.pause()
+	                  assistantBackchannelAudioRef.current = null
+	                }
+	                if (currentAudioRef.current) {
+	                  currentAudioRef.current.pause()
+	                  currentAudioRef.current = null
+	                }
+	                if (pcmStreamPlayerRef.current) {
+	                  pcmStreamPlayerRef.current.stop()
+	                  const audioContext = pcmStreamPlayerRef.current.getAudioContext()
+	                  if (audioContext.state === 'suspended') {
+	                    audioContext.resume().catch((err) => {
+	                      console.error('[PAUSE] Failed to resume audio context after discard:', err)
+	                    })
+	                  }
+	                }
+
+	                // Clear paused state
+	                pausedAssistantMessageIdRef.current = null
+	                pausedAssistantTextRef.current = ''
+	                pausedAtChunkIndexRef.current = 0
+	                pausedAudioPositionRef.current = 0
+
+	                assistantSpeechStateRef.current = 'idle'
+	                setAssistantSpeechState('idle')
+	                setAssistantGenerationState('idle')
+	                setPlayingMessageId(null)
+	                setStatus(null)
+	              }}
+              style={{
+                padding: '8px 16px',
+                backgroundColor: '#f44336',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '14px',
+              }}
+            >
+              ⏹️ Stop
+            </button>
+          </div>
+        )}
 
         {/* Render Steering Cue (PULL principle) */}
         {currentSteeringCue && (

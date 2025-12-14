@@ -191,6 +191,73 @@ VITE_ENABLE_CHAT_STREAM=true
 
 ---
 
+## TODO2: Natural Conversational Flow (C → A → B)
+
+These features are behind flags and are **off by default** in `web/.env.example`.
+
+### ✅ Phase 1 (C): Interruption intent + Pause/Resume
+
+**Enable:**
+```
+VITE_ENABLE_INTERRUPT_INTENT=true
+VITE_ENABLE_PAUSE_RESUME=true
+```
+
+**What to verify:**
+- Speaking over the assistant triggers a **pause** quickly (barge‑in → pause).
+- Saying “continue / go on / go ahead” resumes the paused audio.
+- Saying “no, I meant …” stops the current response and treats it as a correction.
+
+**How to test:**
+1. Ask for a long response (so the assistant speaks for a few seconds).
+2. While the assistant is speaking, say: “wait” or “hold on”.
+3. Confirm the assistant pauses and the UI shows the paused state.
+4. Say: “continue” and confirm playback resumes.
+5. While speaking, say: “no, I meant …” and confirm the assistant stops and your correction is processed as new input.
+
+Console hints: look for `[INTENT]`, `[PAUSE]`, and `[CONTROL]` logs.
+
+---
+
+### ✅ Phase 2 (A): Speak‑While‑Generating (LLM tokens → chunks → TTS)
+
+**Enable:**
+```
+VITE_ENABLE_SPEAK_WHILE_GENERATING=true
+```
+
+**Prerequisites (must already be enabled):**
+```
+VITE_ENABLE_CHAT_STREAM=true
+VITE_ENABLE_TTS_STREAM=true
+```
+
+**What to verify:**
+- On long answers, audio starts after the first chunk (≈ first sentence), not after the full response.
+- No “double speaking” (full answer is not spoken again after chunk playback).
+
+Console hints: look for `[SAY-STREAM]` logs (chunk enqueue / playback).
+
+---
+
+### ✅ Phase 3 (B): Assistant backchannels while the user speaks
+
+**Enable:**
+```
+VITE_ENABLE_ASSISTANT_BACKCHANNELS=true
+```
+
+**Also enable in UI:**
+- Settings → “Assistant backchannels while I'm speaking (headphones recommended)”
+
+**What to verify:**
+- During a long user monologue (≈2–3s), the assistant occasionally plays a quiet “mm‑hmm / right / okay”.
+- Backchannels do not trigger the “user interrupted AI” path.
+
+Console hints: look for `[BACKCHANNEL-AI]` logs.
+
+**Tip:** Use headphones to reduce echo/STT contamination.
+
 ## Troubleshooting
 
 ### Audio feedback/echo issues
@@ -244,4 +311,3 @@ The following features are optional enhancements:
 2. **Partial Transcripts (§5)**: Show live transcription during recording (requires streaming STT)
 
 These features are not critical for natural conversation but can further improve the user experience.
-

@@ -43,7 +43,7 @@ export class ContextAwareThreshold {
    */
   calculateThreshold(context: ConversationContext): number {
     let threshold = this.baseThreshold
-    let adjustmentLog: string[] = []
+    const adjustmentLog: string[] = []
 
     // Factor 1: Question vs statement
     if (context.isQuestion !== undefined) {
